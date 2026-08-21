@@ -1,0 +1,35 @@
+{
+  "name": "pi-check-agent-quota",
+  "version": "0.1.0",
+  "description": "Show AI provider quota and balance in the pi TUI status widget",
+  "keywords": [
+    "pi",
+    "pi-package",
+    "extension",
+    "quota",
+    "balance",
+    "tui",
+    "minimax",
+    "kimi",
+    "glm",
+    "deepseek",
+    "openrouter"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "files": [
+    "extensions"
+  ],
+  "engines": {
+    "node": ">=23.6"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions"
+    ],
+    "image": "https://raw.githubusercontent.com/Linen9/pi-check-agent-quota/main/assets/screenshot.png"
+  }
+}
