@@ -1,4 +1,4 @@
 node_modules/
 *.log
 .DS_Store
-quota-cache.json
+tests/

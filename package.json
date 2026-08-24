@@ -1,6 +1,6 @@
 {
   "name": "pi-check-agent-quota",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Show AI provider quota and balance in the pi TUI status widget",
   "keywords": [
     "pi",
@@ -16,6 +16,11 @@
     "openrouter"
   ],
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Linen9/pi-check-agent-quota.git"
+  },
+  "homepage": "https://github.com/Linen9/pi-check-agent-quota#readme",
   "type": "module",
   "files": [
     "extensions"
