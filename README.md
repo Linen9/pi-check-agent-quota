@@ -27,12 +27,9 @@ API key 复用 pi 已有的 provider 认证，无需额外配置。
 
 ## 显示
 
-默认中文：
+![中文界面](https://raw.githubusercontent.com/Linen9/pi-check-agent-quota/main/assets/screenshot.png)
 
-```text
-限额: 5h 43% (4h52m) / 7d 78% (4d23h)
-余额: $12.34
-```
+![英文界面](https://raw.githubusercontent.com/Linen9/pi-check-agent-quota/main/assets/screenshot-en.png)
 
 - 配额颜色：低用量绿色、接近上限黄色、超限红色；消耗差值紫色；
 - 上一轮消耗：余额 `(¥-0.20)`、桶型 `(-20%)`；回升为正，无变化不带符号；
