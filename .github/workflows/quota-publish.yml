@@ -15,4 +15,11 @@ jobs:
           node-version: '24'
           registry-url: 'https://registry.npmjs.org'
       # 无依赖、无 build 步骤：直接发布（trusted publishing 自动生成 provenance）
-      - run: npm publish
+      # 同一版本已发布时跳过（tag 重推/历史修正不会导致重复发布失败）
+      - run: |
+          VERSION=$(node -p "require('./package.json').version")
+          if npm view pi-check-agent-quota@"$VERSION" version >/dev/null 2>&1; then
+            echo "v$VERSION already published, skipping"
+          else
+            npm publish
+          fi
