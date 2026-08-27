@@ -3,23 +3,15 @@ import { chmodSync, readFileSync } from "node:fs";
 import { chmod, mkdir, rename, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { homedir } from "node:os";
-import { fetchProviderQuota, isUnProvider, normalizeProvider, fetchWithRetry, QuotaError, safeErrorLabel } from "./lib/providers.js";
+import { fetchProviderQuota, isUnProvider, normalizeProvider, fetchWithRetry } from "./lib/providers.js";
 import type { FetchPayload } from "./lib/providers.js";
 import { LOCALES, QUOTA_COLORS, hexFg, formatRemaining, clampPct, visibleWidth, truncateAnsi, formatItems, annotateItems, missingItems, emptyItems, normalizeLanguage, QuotaComponent, type RenderItem, type Language, setCurrentLanguage, getCurrentLanguage } from "./lib/widget.js";
-import { estimateEta, type EtaSample, type EtaEstimate } from "./lib/eta.js";
+import { estimateEta, medianGapMs, ETA_MAX_ROUNDS, RATE_METRIC_PRIORITY, type EtaSample, type EtaEstimate } from "./lib/eta.js";
 
 const STATUS_KEY = "pi-quota";
 const CMD_NAME = "checkaq";
 const AQ10_CMD_NAME = "aq10";
 const AQLANG_CMD_NAME = "aqlang";
-
-const MISSING = "--";
-
-// 余额 ≤ 此阈值（按各 provider 货币单位）变红；可用 PI_QUOTA_BALANCE_ALERT 覆盖
-const BALANCE_ALERT = (() => {
-  const raw = Number(process.env.PI_QUOTA_BALANCE_ALERT);
-  return Number.isFinite(raw) && raw > 0 ? raw : 10;
-})();
 
 const RETRY_COUNT = 3;
 const RETRY_DELAY_MS = 500;
@@ -80,7 +72,6 @@ type RefreshResult =
 
 type RefreshTrigger =
   | "session_start"
-
 
 
 // ---------- module-level 状态 ----------
@@ -237,9 +228,11 @@ function loadFromDisk(): DiskCache | null {
   const disk = readDiskCacheSync();
   if (!disk || Array.isArray(disk.providers)) {
     currentLanguage = "zh";
+    setCurrentLanguage(currentLanguage);
     return null;
   }
   currentLanguage = normalizeLanguage(disk.language) ?? "zh";
+  setCurrentLanguage(currentLanguage);
 
   // 校验通过后再替换内存状态。
   providerState.clear();
@@ -281,8 +274,8 @@ function isSnapshotFresh(snapshot: QuotaSnapshot | null): boolean {
 // 请求状态标注：独立显示不带前导空格，拼接显示带前导空格；无请求状态返回 null。
 function statusAnnotation(leadingSpace: boolean): RenderItem | null {
   const prefix = leadingSpace ? " " : "";
-  if (currentStatus === "fetching") return { kind: "annotation", text: `${prefix}(Fetching)` };
-  if (currentStatus === "failed") return { kind: "annotation", text: `${prefix}(Failed)` };
+  if (currentStatus === "fetching") return { kind: "annotation", text: `${prefix}(${LOCALES[currentLanguage].fetching})` };
+  if (currentStatus === "failed") return { kind: "annotation", text: `${prefix}(${LOCALES[currentLanguage].failed})` };
   return null;
 }
 
@@ -306,10 +299,14 @@ function renderSnapshotWithDiff(
       if (delta === undefined) return undefined;
       if (item.kind === "pct") {
         // 桶型（已使用百分比）：增加 = 消耗 → 负号；减少 = 恢复 → 正号；零值无符号
-        const rounded = Math.round(delta);
+        // 四舍五入到 1 位小数（0.16→0.2）
+        const rounded = Math.round(delta * 10) / 10;
         if (rounded === 0) return "(0%)";
         const sign = rounded > 0 ? "-" : "+";
-        return `(${sign}${Math.abs(rounded)}%)`;
+        const abs = Math.abs(rounded);
+        // 去掉多余的 .0（如 0.6 保持 0.6，1.0 显示 1%）
+        const text = Number.isInteger(abs) ? `${abs}%` : `${abs.toFixed(1).replace(/\.0$/, "")}%`;
+        return `(${sign}${text})`;
       }
       // balance：余额减少 = 消耗 → 负号；增加 = 充值 → 正号；零值无符号
       const cur = snapshot.currency ?? "";
@@ -322,13 +319,13 @@ function renderSnapshotWithDiff(
   }
 
   if (!isIdle) {
-    items.push({ kind: "annotation", text: " (using)" });
+    items.push({ kind: "annotation", text: ` (${LOCALES[currentLanguage].using})` });
   } else {
     // 请求状态优先显示。
     if (diff?.kind === "changed") {
-      items.push({ kind: "annotation", text: " (changed)" });
+      items.push({ kind: "annotation", text: ` (${LOCALES[currentLanguage].changed})` });
     } else if (diff?.kind === "reset") {
-      items.push({ kind: "annotation", text: " (已重置)" });
+      items.push({ kind: "annotation", text: ` (${LOCALES[currentLanguage].reset})` });
     }
     const status = statusAnnotation(true);
     if (status) items.push(status);
@@ -381,10 +378,12 @@ function refreshWidget(ctx: ExtensionContext): void {
   const diff = lastDiff?.kind === "changed" ? { kind: "changed" } as DiffResult : lastDiff;
   cachedItems = renderSnapshotWithDiff(snap, diff, ctx.isIdle());
 
-  // ↓ 新增：行尾追加余量预估（样本不足等情况下 formatEta 返回 null，不渲染）
-  const etaText = formatEta(currentEta(currentProvider!));
-  if (etaText) {
-    cachedItems = [...cachedItems, { kind: "annotation", text: etaText } as RenderItem];
+  // 失败时只显示单行状态（(失败)），不追加 ETA：避免窄窗口拆成两行，且失败时旧快照推算的 ETA 不可信。
+  if (currentStatus !== "failed") {
+    const etaText = formatEta(currentEta(currentProvider!));
+    if (etaText) {
+      cachedItems = [...cachedItems, { kind: "annotation", text: etaText } as RenderItem];
+    }
   }
 
   renderWidget(ctx);
@@ -460,10 +459,9 @@ async function refreshQuota(ctx: ExtensionContext, trigger: RefreshTrigger): Pro
   let resolved: Awaited<ReturnType<ExtensionContext["modelRegistry"]["getProviderAuth"]>>;
   try {
     resolved = await ctx.modelRegistry.getProviderAuth(providerId);
-  } catch (err) {
-    // 认证解析失败也属于当前查询失败，但不把错误详情（可能含敏感信息）写入日志。
+  } catch {
+    // 认证解析失败也属于当前查询失败：静默降级（错误详情可能含敏感信息，不写入日志）。
     if (currentProvider === providerId) {
-      console.error(`[pi-check-agent-quota] ${providerId} auth resolution failed: ${safeErrorLabel(err)}`);
       currentStatus = "failed";
       refreshWidget(ctx);
     }
@@ -531,11 +529,8 @@ async function refreshQuota(ctx: ExtensionContext, trigger: RefreshTrigger): Pro
       if (trigger !== "agent_settled") writeDiskCacheAsync();
       result = { ok: true, snapshot };
     }
-  } catch (err) {
-    const aborted = controller.signal.aborted || (err as Error)?.name === "AbortError";
-    if (!aborted && inflightRequest === request && currentProvider === providerId) {
-      console.error(`[pi-check-agent-quota] ${providerId} quota fetch failed: ${safeErrorLabel(err)}`);
-    }
+  } catch {
+    // 请求失败静默降级：不打印错误日志（错误详情可能含敏感信息）。
     if (inflightRequest === request && currentProvider === providerId) {
       currentStatus = "failed";
     }
@@ -899,15 +894,16 @@ export default function (pi: ExtensionAPI) {
 }
 
 
-
-
 function isValidSnapshot(value: unknown): value is QuotaSnapshot {
+  if (!value || typeof value !== "object") return false;
   const snapshot = value as Partial<QuotaSnapshot>;
-  if (!snapshot || typeof snapshot !== "object") return false;
-  if (typeof snapshot.provider !== "string" || typeof snapshot.fetchedAt !== "number") return false;
-  if (!snapshot.items || !Array.isArray(snapshot.items)) return false;
-  if (!snapshot.metrics || typeof snapshot.metrics !== "object") return false;
-  return true;
+  if (typeof snapshot.provider !== "string" || !Number.isFinite(snapshot.fetchedAt)) return false;
+  try {
+    validatePayload(snapshot as FetchPayload);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function validatePayload(payload: unknown): void {
@@ -925,6 +921,15 @@ function validatePayload(payload: unknown): void {
   ) {
     throw new Error("invalid quota metrics");
   }
+  if (
+    p.resetAt !== undefined &&
+    (!p.resetAt ||
+      typeof p.resetAt !== "object" ||
+      Array.isArray(p.resetAt) ||
+      Object.values(p.resetAt).some((value) => typeof value !== "number" || !Number.isFinite(value) || value <= 0))
+  ) {
+    throw new Error("invalid quota resetAt");
+  }
   for (const raw of p.items) {
     if (!raw || typeof raw !== "object") throw new Error("invalid quota item");
     const item = raw as Record<string, unknown>;
@@ -938,29 +943,42 @@ function validatePayload(payload: unknown): void {
         if (typeof pct !== "number" || !Number.isFinite(pct) || pct < 0) {
           throw new Error("invalid quota pct");
         }
+        if (item.metric !== undefined && typeof item.metric !== "string") {
+          throw new Error("invalid quota metric");
+        }
         break;
       }
       case "balance": {
         const value = item.value;
         if (typeof value !== "number" || !Number.isFinite(value)) throw new Error("invalid quota balance");
-        if (typeof item.currency !== "string") throw new Error("invalid quota currency");
+        if (typeof item.currency !== "string" || item.currency === "") {
+          throw new Error("invalid balance currency");
+        }
+        if (item.metric !== undefined && typeof item.metric !== "string") {
+          throw new Error("invalid quota metric");
+        }
         break;
       }
       default:
         throw new Error("invalid quota item kind");
     }
   }
+  if (p.kind === "balance") {
+    if (typeof p.currency !== "string" || p.currency === "") throw new Error("invalid balance currency");
+    if (!Number.isFinite(metrics.balance)) throw new Error("invalid balance");
+  }
 }
 
 function isValidConsumptionRecord(value: unknown): value is ConsumptionRecord {
+  if (!value || typeof value !== "object") return false;
   const record = value as Partial<ConsumptionRecord>;
-  if (!record || typeof record !== "object") return false;
-  if (typeof record.at !== "number" || record.at <= 0) return false;
+  if (!Number.isFinite(record.at)) return false;
   if (record.kind !== "balance" && record.kind !== "quota") return false;
-  if (!record.deltas || typeof record.deltas !== "object") return false;
+  if (!record.deltas || typeof record.deltas !== "object" || Array.isArray(record.deltas)) return false;
+  if (record.currency !== undefined && typeof record.currency !== "string") return false;
   const values = Object.values(record.deltas);
-  if (values.length === 0 || values.some((v) => typeof v !== "number" || !Number.isFinite(v) || v >= 0)) return false;
-  return true;
+  // 允许 0（空转轮次）以便 ETA 感知近期零消耗，仍拒绝正值与非有限值
+  return values.length > 0 && values.every((value) => Number.isFinite(value) && value <= 0);
 }
 
 function diffSnapshot(before: QuotaSnapshot, after: QuotaSnapshot): DiffResult {
@@ -990,13 +1008,16 @@ function diffSnapshot(before: QuotaSnapshot, after: QuotaSnapshot): DiffResult {
 function diffToConsumption(diff: DiffResult): Record<string, number> | null {
   const out: Record<string, number> = {};
   if (diff.kind === "balance") {
-    // 余额减少才是消耗。
+    // 余额增加可能是充值或调整，无法证明本轮无消耗，不生成消费样本。
     const value = diff.deltas.balance;
-    if (Number.isFinite(value) && value < 0) out.balance = value;
+    if (Number.isFinite(value)) {
+      if (value < 0) out.balance = value;
+      else if (value === 0) out.balance = 0;
+    }
   } else if (diff.kind === "quota") {
-    // 使用率增加代表消耗，反转为负值保存。
+    // 使用率增加代表消耗，反转为负值；回退或不变都记录为 0。
     for (const [key, value] of Object.entries(diff.deltas)) {
-      if (Number.isFinite(value) && value > 0) out[key] = -value;
+      if (Number.isFinite(value)) out[key] = value > 0 ? -value : 0;
     }
   }
   return Object.keys(out).length > 0 ? out : null;
@@ -1008,21 +1029,67 @@ function appendConsumption(records: ConsumptionRecord[] | undefined, record: Con
 }
 
 // ---------- ETA 胶水 (有状态，依赖 currentProvider / providerState) ----------
+// 速率源按窗口优先级取最短可用窗口（5h → used → 7d → mo，见 RATE_METRIC_PRIORITY）：
+// 5h/used 的 delta 是真实单轮消耗；7d/mo 是滑动窗口（delta 含滑出抵消），
+// 仅在 provider 没有更小窗口时作为回退。
+// 各桶轮数 = 各自剩余量 ÷ 统一速率，取最先耗尽的瓶颈。
 function currentEta(provider: string): EtaEstimate | null {
   const snap = latestLineSnapshot(provider);
   const records = providerState.get(provider)?.consumptions;
   if (!snap || !records) return null;
 
+  const metrics = Object.keys(snap.metrics);
+
+  // 余额型：单指标，直接估算。
   if (snap.kind === "balance") {
     return estimateEta(toSamples(records, "balance"), snap.metrics.balance ?? 0);
   }
-  // 取所有桶中剩余轮数最小的（最先耗尽的瓶颈）
+
+  // 任一桶已耗尽：整体已没有可用轮次，不能跳过该瓶颈去展示其他桶的 ETA。
+  for (const metric of metrics) {
+    if (100 - clampPct(snap.metrics[metric]) <= 0) return null;
+  }
+
+  // 速率源按优先级选取：5h（短窗口）→ used（累计型）→ 7d → mo。
+  // 5h/used 的 delta 是真实单轮消耗；7d/mo 是滑动窗口（delta 含滑出抵消），
+  // 仅在 provider 没有更小窗口时作为回退。
+  const rateMetric = RATE_METRIC_PRIORITY.find((m) => metrics.includes(m)) ?? null;
+  if (rateMetric === null) return null; // 无可识别窗口：不估算
+  const rateSamples = toSamples(records, rateMetric);
+  const remainingRate = 100 - clampPct(snap.metrics[rateMetric]);
+  const rateEta = estimateEta(rateSamples, remainingRate);
+  if (rateEta?.zeroRounds !== undefined) {
+    // 速率桶近期无消耗：整体显示“近x轮0消耗”。
+    return { rounds: 0, activeMs: 0, zeroRounds: rateEta.zeroRounds };
+  }
+  if (!rateEta || rateEta.rounds <= 0 || rateEta.activeMs <= 0) return null;
+  const perRound = remainingRate / rateEta.rounds;
+  if (!Number.isFinite(perRound) || perRound <= 0) return null;
+
+  const msPerRound = medianGapMs(rateSamples);
+
+  // 各桶轮数 = 剩余量 ÷ 统一速率；取最小（最先耗尽的瓶颈）。
   let best: EtaEstimate | null = null;
-  for (const metric of Object.keys(snap.metrics)) {
+  let bestRounds = Number.POSITIVE_INFINITY;
+  for (const metric of metrics) {
     const remaining = 100 - clampPct(snap.metrics[metric]);
-    const eta = estimateEta(toSamples(records, metric), remaining);
-    if (!eta) continue;
-    if (!best || eta.rounds < best.rounds) best = eta;
+    const resetAt = snap.resetAt?.[metric];
+    if (resetAt !== undefined) {
+      const resetRemainingMs = resetAt - Date.now();
+      if (resetRemainingMs <= 0) return null; // 已过期视为异常
+      const roundsInWindow = remaining / perRound;
+      const activeMs = roundsInWindow * msPerRound;
+      if (activeMs > resetRemainingMs) {
+        // 该桶在耗尽前会先重置（重置后恢复），不构成约束，跳过。
+        continue;
+      }
+    }
+    const rounds = remaining / perRound;
+    if (!Number.isFinite(rounds) || rounds <= 0) return null;
+    if (rounds < bestRounds) {
+      bestRounds = rounds;
+      best = { rounds, activeMs: rounds * msPerRound };
+    }
   }
   return best;
 }
@@ -1041,6 +1108,16 @@ function toSamples(records: ConsumptionRecord[], metric: string): EtaSample[] {
 
 function formatEta(eta: EtaEstimate | null): string | null {
   if (!eta) return null;
+  const locale = LOCALES[currentLanguage];
+  const label = currentLanguage === "zh" ? "预计可用" : "Available";
+  // 该桶近期无消耗：显示“近x轮0消耗”，不显示轮数 ETA。
+  if (eta.zeroRounds !== undefined) {
+    return locale.etaZeroRounds(eta.zeroRounds);
+  }
+  // 显示上限：超过 ETA_MAX_ROUNDS 显示 "365+"，防止荒谬的几百轮。
+  if (eta.rounds > ETA_MAX_ROUNDS) {
+    return ` ${label}：${ETA_MAX_ROUNDS}+轮`;
+  }
   const rounds = Math.max(1, Math.round(eta.rounds));
   const time = formatRemaining(eta.activeMs);
   const isUrgentRounds = rounds <= 5;
@@ -1049,7 +1126,7 @@ function formatEta(eta: EtaEstimate | null): string | null {
   const roundsPart = isUrgentRounds ? hexFg(QUOTA_COLORS.red, String(rounds)) : String(rounds);
   const timePart = isUrgentTime ? hexFg(QUOTA_COLORS.red, time) : time;
   if (!time) {
-    return ` 预计可用：${roundsPart}轮`;
+    return ` ${label}：${roundsPart}轮`;
   }
-  return ` 预计可用：${roundsPart}轮/${timePart}`;
+  return ` ${label}：${roundsPart}轮/${timePart}`;
 }

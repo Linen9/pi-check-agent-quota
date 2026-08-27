@@ -35,7 +35,7 @@
     "extensions": [
       "./extensions/index.ts"
     ],
-    "image": "https://raw.githubusercontent.com/Linen9/pi-check-agent-quota/main/assets/screenshot.png"
+    "image": "https://raw.githubusercontent.com/Linen9/pi-check-agent-quota/main/assets/screenshot-en.png"
   },
   "main": "extensions/index.ts"
 }

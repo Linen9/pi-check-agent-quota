@@ -13,6 +13,8 @@ export type FetchPayload = {
   items: RenderItem[];
   metrics: Record<string, number>;
   currency?: string;
+  // 各配额桶的绝对重置时间（Unix 毫秒）；未知或已过期时省略。
+  resetAt?: Record<string, number>;
 };
 
 export type Fetcher = (auth: Auth, signal: AbortSignal) => Promise<FetchPayload>;
@@ -31,15 +33,6 @@ export class QuotaError extends Error {
     this.category = category;
     this.status = status !== undefined && Number.isFinite(status) ? status : undefined;
   }
-}
-
-// 日志只允许输出固定错误类别和 HTTP 状态，绝不输出响应 body、URL 或 Error 对象。
-export function safeErrorLabel(error: unknown): string {
-  if (error instanceof QuotaError) {
-    return error.status === undefined ? error.category : `${error.category} (${error.status})`;
-  }
-  if (error instanceof DOMException && error.name === "AbortError") return "aborted";
-  return error instanceof Error ? "error" : "unknown";
 }
 
 export function finiteNumber(value: unknown): number | null {
@@ -108,9 +101,15 @@ export function tier(prefix: string, label: string, pct: number, reset: string):
   ];
 }
 
+export function resetAtFromISO(iso: string): number | null {
+  const resetAt = new Date(iso).getTime();
+  return Number.isFinite(resetAt) && resetAt > Date.now() ? resetAt : null;
+}
+
 export function formatResetFromISO(iso: string): string {
-  const diff = new Date(iso).getTime() - Date.now();
-  if (Number.isNaN(diff) || diff <= 0) return "";
+  const resetAt = resetAtFromISO(iso);
+  if (resetAt === null) return "";
+  const diff = resetAt - Date.now();
   return diff >= 24 * 3600000 ? formatDays(diff) : formatRemaining(diff);
 }
 
@@ -192,13 +191,13 @@ export async function fetchWithRetry<T>(signal: AbortSignal, fn: () => Promise<T
 
 // 表驱动：加新 provider 只改这张表
 export const PROVIDER_FETCHERS: Record<string, Fetcher> = {
-  minimax: fetchMinimax,
-  "minimax-cn": fetchMinimax,
-  moonshotai: fetchKimi,
-  "moonshotai-cn": fetchKimi,
+  minimax: fetchMinimaxGlobal,
+  "minimax-cn": fetchMinimaxCn,
+  moonshotai: fetchMoonshotGlobal,
+  "moonshotai-cn": fetchMoonshotCn,
   "kimi-coding": fetchKimi,
-  zai: fetchZhipu,
-  "zai-coding-cn": fetchZhipu,
+  zai: fetchZhipuBalance,
+  "zai-coding-cn": fetchZhipuCoding,
   deepseek: fetchDeepseek,
   openrouter: fetchOpenrouter,
   "opencode-go": fetchOpencodeGo,
@@ -244,8 +243,9 @@ export async function fetchProviderQuota(
 
 /** MiniMax: GET {base}/v1/token_plan/remains
  *  字段无官方 schema，按线上观察解析；weekly 字段缺失时按 1.0x 计算。 */
-export async function fetchMinimax(auth: Auth, signal: AbortSignal): Promise<FetchPayload> {
-  const url = quotaUrl(auth.baseUrl, "https://www.minimaxi.com", "/v1/token_plan/remains");
+/** MiniMax Token Plan 共用实现：国际站 api.minimax.io / 国内站 api.minimaxi.com（订阅 key 与站点绑定）。 */
+async function fetchMinimaxBase(auth: Auth, signal: AbortSignal, defaultBase: string): Promise<FetchPayload> {
+  const url = quotaUrl(auth.baseUrl, defaultBase, "/v1/token_plan/remains");
   const j = await jsonFetch<any>(
     url,
     bearerHeaders(auth.apiKey, { "Content-Type": "application/json" }),
@@ -277,25 +277,75 @@ export async function fetchMinimax(auth: Auth, signal: AbortSignal): Promise<Fet
   if (weeklyBoostPermille < 0) throw new Error("invalid MiniMax weekly boost");
   const weeklyBoost = weeklyBoostPermille / 1000;
   const weeklyPct = weeklyRemaining === null ? 0 : (100 - weeklyRemaining) * weeklyBoost;
-  const fiveHourReset = formatRemaining(general.remains_time);
-  const weeklyReset = formatDays(general.weekly_remains_time);
+  const fiveHourResetMs = sanitizeMs(general.remains_time);
+  const weeklyResetMs = sanitizeMs(general.weekly_remains_time);
+  const fiveHourReset = fiveHourResetMs === null ? "" : formatRemaining(fiveHourResetMs);
+  const weeklyReset = weeklyResetMs === null ? "" : formatDays(weeklyResetMs);
+  const resetAt: Record<string, number> = {};
+  if (fiveHourResetMs !== null) resetAt["5h"] = Date.now() + fiveHourResetMs;
 
   const items = tier("Usage: ", "5h ", fiveHourPct, fiveHourReset);
   const metrics: Record<string, number> = { "5h": fiveHourPct };
   if (weeklyStatus === 1 && weeklyRemaining !== null) {
     items.push(...tier(" / ", "7d ", weeklyPct, weeklyReset));
     metrics["7d"] = weeklyPct;
+    if (weeklyResetMs !== null) resetAt["7d"] = Date.now() + weeklyResetMs;
   }
-  return { kind: "quota", items, metrics };
+  return {
+    kind: "quota",
+    items,
+    metrics,
+    resetAt: Object.keys(resetAt).length > 0 ? resetAt : undefined,
+  };
+}
+
+/** MiniMax 国际站（minimax） */
+export async function fetchMinimaxGlobal(auth: Auth, signal: AbortSignal): Promise<FetchPayload> {
+  return fetchMinimaxBase(auth, signal, "https://api.minimax.io");
+}
+
+/** MiniMax 国内站（minimax-cn） */
+export async function fetchMinimaxCn(auth: Auth, signal: AbortSignal): Promise<FetchPayload> {
+  return fetchMinimaxBase(auth, signal, "https://api.minimaxi.com");
 }
 
 /** Kimi For Coding: GET {base}/v1/usages */
+/** Moonshot/Kimi 开放平台余额共用实现：GET {base}/users/me/balance（按量付费）。
+ *  国际站 api.moonshot.ai（USD）/ 国内站 api.moonshot.cn（CNY）。
+ *  kimi-coding（Kimi For Coding 订阅）是桶型，走 fetchKimi 的 /v1/usages，不在此处。 */
+async function fetchMoonshotBase(auth: Auth, signal: AbortSignal, defaultBase: string, currency: string): Promise<FetchPayload> {
+  const url = quotaUrl(auth.baseUrl, defaultBase, "/users/me/balance");
+  const j = await jsonFetch<any>(url, bearerHeaders(auth.apiKey), 10_000, signal);
+  const data = j?.data ?? j;
+  const balance = requiredNumber(data.available_balance ?? data.balance, "Moonshot available balance");
+  return {
+    kind: "balance",
+    items: [
+      { kind: "text", text: "Balance: " },
+      { kind: "balance", value: balance, currency, metric: "balance" },
+    ],
+    metrics: { balance },
+    currency,
+  };
+}
+
+/** Moonshot AI 国际站（moonshotai）：api.moonshot.ai，USD */
+export async function fetchMoonshotGlobal(auth: Auth, signal: AbortSignal): Promise<FetchPayload> {
+  return fetchMoonshotBase(auth, signal, "https://api.moonshot.ai/v1", "$");
+}
+
+/** Moonshot AI 国内站（moonshotai-cn）：api.moonshot.cn，CNY */
+export async function fetchMoonshotCn(auth: Auth, signal: AbortSignal): Promise<FetchPayload> {
+  return fetchMoonshotBase(auth, signal, "https://api.moonshot.cn/v1", "¥");
+}
+
 export async function fetchKimi(auth: Auth, signal: AbortSignal): Promise<FetchPayload> {
   const url = quotaUrl(auth.baseUrl, "https://api.kimi.com/coding", "/v1/usages");
   const j = await jsonFetch<any>(url, bearerHeaders(auth.apiKey), 10_000, signal);
 
   const items: RenderItem[] = [];
   const metrics: Record<string, number> = {};
+  const resetAt: Record<string, number> = {};
   const fiveHour = j.limits?.[0]?.detail;
   if (fiveHour) {
     const limit = requiredNumber(fiveHour.limit, "Kimi 5h limit");
@@ -304,6 +354,8 @@ export async function fetchKimi(auth: Auth, signal: AbortSignal): Promise<FetchP
     const pct = usedPct(limit, remaining);
     items.push(...tier("Usage: ", "5h ", pct, formatResetFromISO(fiveHour.resetTime ?? "")));
     metrics["5h"] = pct;
+    const fiveHourResetAt = resetAtFromISO(fiveHour.resetTime ?? "");
+    if (fiveHourResetAt !== null) resetAt["5h"] = fiveHourResetAt;
   }
   const weekly = j.usage;
   if (weekly) {
@@ -313,14 +365,51 @@ export async function fetchKimi(auth: Auth, signal: AbortSignal): Promise<FetchP
     const pct = usedPct(limit, remaining);
     items.push(...tier(" / ", "7d ", pct, formatResetFromISO(weekly.resetTime ?? "")));
     metrics["7d"] = pct;
+    const weeklyResetAt = resetAtFromISO(weekly.resetTime ?? "");
+    if (weeklyResetAt !== null) resetAt["7d"] = weeklyResetAt;
   }
   if (items.length === 0) throw new Error("no quota data");
-  return { kind: "quota", items, metrics };
+  return {
+    kind: "quota",
+    items,
+    metrics,
+    resetAt: Object.keys(resetAt).length > 0 ? resetAt : undefined,
+  };
 }
 
 /** Zhipu GLM: GET https://open.bigmodel.cn/api/monitor/usage/quota/limit
  *  无 coding plan 时端点返回 500 / code≠0；用裸 API key 当 Authorization value（不加 Bearer） */
-export async function fetchZhipu(auth: Auth, signal: AbortSignal): Promise<FetchPayload> {
+/** Zhipu GLM (zai): GET https://www.bigmodel.cn/api/biz/account/query-customer-account-report
+ *  账户现金余额。zai 是余额型配置（pi auth 中选择 zai 时使用）。 */
+export async function fetchZhipuBalance(auth: Auth, signal: AbortSignal): Promise<FetchPayload> {
+  const j = await jsonFetch<any>(
+    "https://www.bigmodel.cn/api/biz/account/query-customer-account-report",
+    { Authorization: auth.apiKey },
+    10_000,
+    signal,
+  );
+  if (j.code !== undefined && j.code !== 0 && j.code !== 200) {
+    throw new QuotaError("provider_rejected", finiteNumber(j.code) ?? undefined);
+  }
+  const data = j.data;
+  if (!data || typeof data !== "object") throw new Error("no Zhipu account data");
+  // availableBalance 是可用的现金余额（充值 − 已用 − 冻结）。
+  const balance = requiredNumber(data.availableBalance ?? data.balance, "Zhipu available balance");
+  return {
+    kind: "balance",
+    items: [
+      { kind: "text", text: "Balance: " },
+      { kind: "balance", value: balance, currency: "¥", metric: "balance" },
+    ],
+    metrics: { balance },
+    currency: "¥",
+  };
+}
+
+/** Zhipu GLM Coding Plan (zai-coding-cn): GET https://open.bigmodel.cn/api/monitor/usage/quota/limit
+ *  Coding Plan 订阅配额。zai-coding-cn 是桶型配置（pi auth 中选择 zai-coding-cn 时使用）；
+ *  非订阅账户该端点返回 code=500 "当前用户不存在coding plan"。 */
+export async function fetchZhipuCoding(auth: Auth, signal: AbortSignal): Promise<FetchPayload> {
   const j = await jsonFetch<any>(
     "https://open.bigmodel.cn/api/monitor/usage/quota/limit",
     { Authorization: auth.apiKey },
@@ -418,6 +507,7 @@ export async function fetchOpencodeGo(auth: Auth, signal: AbortSignal): Promise<
   ] as const;
   const items: RenderItem[] = [];
   const metrics: Record<string, number> = {};
+  const resetAtByMetric: Record<string, number> = {};
 
   for (const [index, window] of windows.entries()) {
     const usage = window.keys
@@ -435,21 +525,38 @@ export async function fetchOpencodeGo(auth: Auth, signal: AbortSignal): Promise<
       `OpenCode Go ${window.keys[0]} usage percent`,
     );
     const resetsAt = usage.resetsAt;
+    let resetAt: number | null = null;
+    let reset = "";
     if (typeof resetsAt === "string") {
       const resetTime = new Date(resetsAt).getTime();
       if (Number.isNaN(resetTime)) throw new Error(`invalid OpenCode Go ${window.keys[0]} reset`);
+      const remainingMs = resetTime - Date.now();
+      if (remainingMs > 0) {
+        resetAt = resetTime;
+        reset = window.longReset ? formatDays(remainingMs) : formatRemaining(remainingMs);
+      }
     } else if (usage.resetInSec === undefined && usage.resetSeconds === undefined) {
       throw new Error(`missing OpenCode Go ${window.keys[0]} reset`);
+    } else {
+      const resetMs = requiredNumber(
+        usage.resetInSec ?? usage.resetSeconds,
+        `OpenCode Go ${window.keys[0]} reset`,
+      ) * 1000;
+      if (resetMs > 0) {
+        resetAt = Date.now() + resetMs;
+        reset = window.longReset ? formatDays(resetMs) : formatRemaining(resetMs);
+      }
     }
-    const reset = typeof resetsAt === "string"
-      ? formatResetFromISO(resetsAt)
-      : window.longReset
-        ? formatDays(requiredNumber(usage.resetInSec ?? usage.resetSeconds, `OpenCode Go ${window.keys[0]} reset`) * 1000)
-        : formatRemaining(requiredNumber(usage.resetInSec ?? usage.resetSeconds, `OpenCode Go ${window.keys[0]} reset`) * 1000);
     items.push(...tier(index === 0 ? "Usage: " : " / ", window.label, pct, reset));
     metrics[window.label.trim()] = pct;
+    if (resetAt !== null) resetAtByMetric[window.label.trim()] = resetAt;
   }
 
-  return { kind: "quota", items, metrics };
+  return {
+    kind: "quota",
+    items,
+    metrics,
+    resetAt: Object.keys(resetAtByMetric).length > 0 ? resetAtByMetric : undefined,
+  };
 }
 

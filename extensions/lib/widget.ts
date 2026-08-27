@@ -29,8 +29,7 @@ export type Locale = {
   checkaqDescription: string;
   aq10Description: string;
   aqlangDescription: string;
-  etaWithTime: (rounds: number, time: string) => string;
-  etaRoundsOnly: (rounds: number) => string;
+  etaZeroRounds: (count: number) => string;
 };
 
 export const LOCALES: Record<Language, Locale> = {
@@ -51,8 +50,7 @@ export const LOCALES: Record<Language, Locale> = {
     checkaqDescription: "强制刷新限额并显示当前 provider 详情",
     aq10Description: "显示最近 10 轮对话消耗记录",
     aqlangDescription: "切换界面语言（zh/en）",
-    etaWithTime: (rounds, time) => ` 预计可用：${rounds}轮/${time}`,
-    etaRoundsOnly: (rounds) => ` 预计可用：${rounds}轮`,
+    etaZeroRounds: (count) => ` 预计可用：近${count}轮0消耗`,
   },
   en: {
     usage: "Usage",
@@ -71,8 +69,7 @@ export const LOCALES: Record<Language, Locale> = {
     checkaqDescription: "Force-refresh quota and show detailed widget for current provider",
     aq10Description: "Show the last 10 conversation consumption records",
     aqlangDescription: "Switch interface language (zh/en)",
-    etaWithTime: (rounds, time) => ` Available: ${rounds} rounds/${time}`,
-    etaRoundsOnly: (rounds) => ` Available: ${rounds} rounds`,
+    etaZeroRounds: (count) => ` Available: 0 used in last ${count} rounds`,
   },
 };
 
@@ -86,6 +83,12 @@ type DiskCache = {
   active_round?: ActiveRound;
   providers: Record<string, ProviderCache>;
 };
+
+const MISSING = "--";
+const BALANCE_ALERT = (() => {
+  const raw = Number(process.env.PI_QUOTA_BALANCE_ALERT);
+  return Number.isFinite(raw) && raw > 0 ? raw : 10;
+})();
 
 export const QUOTA_COLORS = {
   green: "#1FA87A",
@@ -130,7 +133,7 @@ export function formatItems(items: RenderItem[], theme: Theme): string {
       if (it.kind === "balance") return balanceColor(it.value, it.currency, theme);
       const text = localizeText(it.text);
       // ETA 基色跟随“限额”二字（dim），仅紧急片段已在 formatEta 中标红
-      if (text.includes("预计可用") || text.includes("轮·")) {
+      if (text.includes("预计可用") || text.includes("Available:")) {
         return theme.fg("dim", text);
       }
       return hexFg(QUOTA_COLORS.consumption, text);
@@ -247,8 +250,8 @@ export class QuotaComponent implements Component {
     if (this.cache && this.cache.width === width) return this.cache.lines;
     // 左右贴边：左区（配额）贴左，右区（ETA）贴右；窄窗口换行
     const etaIdx = this.items.findIndex((it) => it.kind === "annotation" && it.text.includes("预计可用"));
-    // 兼容英文：也检测 "est."
-    const etaIdxEn = etaIdx === -1 ? this.items.findIndex((it) => it.kind === "annotation" && it.text.includes("est.")) : -1;
+    // 兼容英文：也检测 "Available:"
+    const etaIdxEn = etaIdx === -1 ? this.items.findIndex((it) => it.kind === "annotation" && it.text.includes("Available:")) : -1;
     const splitIdx = etaIdx !== -1 ? etaIdx : etaIdxEn;
     if (splitIdx === -1) {
       const text = formatItems(this.items, this.themeRef());
