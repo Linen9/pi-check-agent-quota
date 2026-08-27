@@ -1,6 +1,6 @@
 {
   "name": "pi-check-agent-quota",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Show AI provider quota and balance in the pi TUI status widget",
   "keywords": [
     "pi",
@@ -33,8 +33,9 @@
   },
   "pi": {
     "extensions": [
-      "./extensions"
+      "./extensions/index.ts"
     ],
     "image": "https://raw.githubusercontent.com/Linen9/pi-check-agent-quota/main/assets/screenshot.png"
-  }
+  },
+  "main": "extensions/index.ts"
 }
