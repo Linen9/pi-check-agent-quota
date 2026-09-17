@@ -1,5 +1,3 @@
-// lib/providers.ts
-// HTTP 助手 + 6 fetcher + 路由表。纯函数，零 pi 依赖。
 export type Auth = { apiKey: string; baseUrl?: string };
 
 export type RenderItem =
@@ -13,7 +11,7 @@ export type FetchPayload = {
   items: RenderItem[];
   metrics: Record<string, number>;
   currency?: string;
-  // 各配额桶的绝对重置时间（Unix 毫秒）；未知或已过期时省略。
+
   resetAt?: Record<string, number>;
 };
 
@@ -54,7 +52,6 @@ export function requiredPercent(value: unknown, label: string): number {
   return n;
 }
 
-
 export function sanitizeMs(ms: unknown): number | null {
   const n = Number(ms);
   return Number.isFinite(n) && n > 0 ? n : null;
@@ -78,7 +75,6 @@ export function formatDays(ms: unknown): string {
   return `${d}d${h}h`;
 }
 
-// 钳制到 [0,100]；NaN/非数字归零，避免异常值显示成低用量绿。
 export function clampPct(pct: unknown): number {
   const n = Number(pct);
   if (!Number.isFinite(n)) return 0;
@@ -91,7 +87,6 @@ export function usedPct(limit: unknown, remaining: unknown): number {
   if (!Number.isFinite(lim) || !Number.isFinite(rem) || lim <= 0) return 0;
   return clampPct(((lim - rem) / lim) * 100);
 }
-
 
 export function tier(prefix: string, label: string, pct: number, reset: string): RenderItem[] {
   return [
@@ -117,7 +112,6 @@ export function bearerHeaders(apiKey: string, extra: Record<string, string> = {}
   return { Authorization: `Bearer ${apiKey}`, ...extra };
 }
 
-// 自定义 baseUrl 只允许 HTTPS；本机回环地址可使用 HTTP，避免把 API key 发往明文公网地址。
 export function quotaUrl(customBaseUrl: string | undefined, defaultBaseUrl: string, path: string): string {
   const raw = customBaseUrl?.trim() || defaultBaseUrl;
   let parsed: URL;
@@ -139,12 +133,10 @@ export function quotaUrl(customBaseUrl: string | undefined, defaultBaseUrl: stri
   return `${parsed.origin}${basePath}${suffix}`;
 }
 
-// 合并超时和外部 abort signal：任一触发都中断 fetch
 export function makeSignal(timeoutMs: number, external: AbortSignal): AbortSignal {
   return AbortSignal.any([AbortSignal.timeout(timeoutMs), external]);
 }
 
-// fetch + status 校验 + body 解析；错误中不携带响应 body，避免敏感信息进入日志
 export async function jsonFetch<T = any>(
   url: string,
   headers: Record<string, string>,
@@ -161,12 +153,11 @@ export async function jsonFetch<T = any>(
   try {
     return JSON.parse(raw) as T;
   } catch {
-    // 不把响应片段放进错误消息，避免服务端 body 被写入日志。
+
     throw new QuotaError("invalid_json");
   }
 }
 
-// 重试：500ms 间隔，最多 3 次，仅当外部 signal 未 abort 时继续
 export async function fetchWithRetry<T>(signal: AbortSignal, fn: () => Promise<T>): Promise<T> {
   let lastErr: unknown;
   for (let attempt = 0; attempt < RETRY_COUNT; attempt++) {
@@ -184,12 +175,6 @@ export async function fetchWithRetry<T>(signal: AbortSignal, fn: () => Promise<T
   throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
 }
 
-// ---------- 快照差异 ----------
-
-// ---------- provider 路由 ----------
-
-
-// 表驱动：加新 provider 只改这张表
 export const PROVIDER_FETCHERS: Record<string, Fetcher> = {
   minimax: fetchMinimaxGlobal,
   "minimax-cn": fetchMinimaxCn,
@@ -201,10 +186,9 @@ export const PROVIDER_FETCHERS: Record<string, Fetcher> = {
   deepseek: fetchDeepseek,
   openrouter: fetchOpenrouter,
   "opencode-go": fetchOpencodeGo,
+  "openai-codex": fetchOpenaiCodex,
 };
 
-// 这些 provider 没有 API-key 可查的配额接口，统一显示 --
-// volcengine/doubao 的 GetCodingPlanUsage 需要 HMAC-SHA256 V4 签名，暂未支持
 export const UN_PROVIDERS: ReadonlySet<string> = new Set([
   "volcengine",
   "doubao",
@@ -217,12 +201,10 @@ export const UN_PROVIDERS: ReadonlySet<string> = new Set([
   "xiaomi-token-plan-sgp",
 ]);
 
-// 每个 provider 别名独立缓存。
 export function normalizeProvider(provider: string | undefined): string | null {
   return provider ?? null;
 }
 
-// 未列入 fetcher 的 provider 显示 --。
 export function isUnProvider(provider: string): boolean {
   return UN_PROVIDERS.has(provider) || !Object.hasOwn(PROVIDER_FETCHERS, provider);
 }
@@ -232,18 +214,13 @@ export async function fetchProviderQuota(
   auth: Auth,
   signal: AbortSignal,
 ): Promise<FetchPayload | null> {
-  // 兜底：未支持 provider 返回 null。
+
   if (isUnProvider(providerId)) return null;
   const fetcher = PROVIDER_FETCHERS[providerId];
   if (!fetcher) return null;
   return fetcher(auth, signal);
 }
 
-// ---------- 各 provider fetchers ----------
-
-/** MiniMax: GET {base}/v1/token_plan/remains
- *  字段无官方 schema，按线上观察解析；weekly 字段缺失时按 1.0x 计算。 */
-/** MiniMax Token Plan 共用实现：国际站 api.minimax.io / 国内站 api.minimaxi.com（订阅 key 与站点绑定）。 */
 async function fetchMinimaxBase(auth: Auth, signal: AbortSignal, defaultBase: string): Promise<FetchPayload> {
   const url = quotaUrl(auth.baseUrl, defaultBase, "/v1/token_plan/remains");
   const j = await jsonFetch<any>(
@@ -269,7 +246,7 @@ async function fetchMinimaxBase(auth: Auth, signal: AbortSignal, defaultBase: st
   const weeklyRemaining = weeklyRaw === undefined || weeklyRaw === null
     ? null
     : requiredPercent(weeklyRaw, "MiniMax 7d remaining percent");
-  // weekly boost 缺失按 1.0x 计算；负值拒绝整次更新。
+
   const weeklyBoostRaw = general.weekly_boost_permille;
   const weeklyBoostPermille = weeklyBoostRaw === undefined || weeklyBoostRaw === null
     ? DEFAULT_BOOST_PERMILLE
@@ -299,20 +276,14 @@ async function fetchMinimaxBase(auth: Auth, signal: AbortSignal, defaultBase: st
   };
 }
 
-/** MiniMax 国际站（minimax） */
 export async function fetchMinimaxGlobal(auth: Auth, signal: AbortSignal): Promise<FetchPayload> {
   return fetchMinimaxBase(auth, signal, "https://api.minimax.io");
 }
 
-/** MiniMax 国内站（minimax-cn） */
 export async function fetchMinimaxCn(auth: Auth, signal: AbortSignal): Promise<FetchPayload> {
   return fetchMinimaxBase(auth, signal, "https://api.minimaxi.com");
 }
 
-/** Kimi For Coding: GET {base}/v1/usages */
-/** Moonshot/Kimi 开放平台余额共用实现：GET {base}/users/me/balance（按量付费）。
- *  国际站 api.moonshot.ai（USD）/ 国内站 api.moonshot.cn（CNY）。
- *  kimi-coding（Kimi For Coding 订阅）是桶型，走 fetchKimi 的 /v1/usages，不在此处。 */
 async function fetchMoonshotBase(auth: Auth, signal: AbortSignal, defaultBase: string, currency: string): Promise<FetchPayload> {
   const url = quotaUrl(auth.baseUrl, defaultBase, "/users/me/balance");
   const j = await jsonFetch<any>(url, bearerHeaders(auth.apiKey), 10_000, signal);
@@ -329,14 +300,22 @@ async function fetchMoonshotBase(auth: Auth, signal: AbortSignal, defaultBase: s
   };
 }
 
-/** Moonshot AI 国际站（moonshotai）：api.moonshot.ai，USD */
 export async function fetchMoonshotGlobal(auth: Auth, signal: AbortSignal): Promise<FetchPayload> {
   return fetchMoonshotBase(auth, signal, "https://api.moonshot.ai/v1", "$");
 }
 
-/** Moonshot AI 国内站（moonshotai-cn）：api.moonshot.cn，CNY */
 export async function fetchMoonshotCn(auth: Auth, signal: AbortSignal): Promise<FetchPayload> {
   return fetchMoonshotBase(auth, signal, "https://api.moonshot.cn/v1", "¥");
+}
+
+function kimiWindowPct(detail: { limit?: unknown; remaining?: unknown; used?: unknown }, label: string): number {
+  const limit = requiredNumber(detail.limit, `Kimi ${label} limit`);
+  if (limit <= 0) throw new Error(`invalid Kimi ${label} limit`);
+  const remaining = finiteNumber(detail.remaining);
+  if (remaining !== null) return usedPct(limit, remaining);
+  const used = finiteNumber(detail.used);
+  if (used !== null) return clampPct((used / limit) * 100);
+  throw new Error(`no Kimi ${label} usage fields`);
 }
 
 export async function fetchKimi(auth: Auth, signal: AbortSignal): Promise<FetchPayload> {
@@ -346,23 +325,19 @@ export async function fetchKimi(auth: Auth, signal: AbortSignal): Promise<FetchP
   const items: RenderItem[] = [];
   const metrics: Record<string, number> = {};
   const resetAt: Record<string, number> = {};
+
   const fiveHour = j.limits?.[0]?.detail;
   if (fiveHour) {
-    const limit = requiredNumber(fiveHour.limit, "Kimi 5h limit");
-    const remaining = requiredNumber(fiveHour.remaining, "Kimi 5h remaining");
-    if (limit <= 0) throw new Error("invalid Kimi 5h limit");
-    const pct = usedPct(limit, remaining);
+    const pct = kimiWindowPct(fiveHour, "5h");
     items.push(...tier("Usage: ", "5h ", pct, formatResetFromISO(fiveHour.resetTime ?? "")));
     metrics["5h"] = pct;
     const fiveHourResetAt = resetAtFromISO(fiveHour.resetTime ?? "");
     if (fiveHourResetAt !== null) resetAt["5h"] = fiveHourResetAt;
   }
+
   const weekly = j.usage;
   if (weekly) {
-    const limit = requiredNumber(weekly.limit, "Kimi 7d limit");
-    const remaining = requiredNumber(weekly.remaining, "Kimi 7d remaining");
-    if (limit <= 0) throw new Error("invalid Kimi 7d limit");
-    const pct = usedPct(limit, remaining);
+    const pct = kimiWindowPct(weekly, "7d");
     items.push(...tier(" / ", "7d ", pct, formatResetFromISO(weekly.resetTime ?? "")));
     metrics["7d"] = pct;
     const weeklyResetAt = resetAtFromISO(weekly.resetTime ?? "");
@@ -377,10 +352,6 @@ export async function fetchKimi(auth: Auth, signal: AbortSignal): Promise<FetchP
   };
 }
 
-/** Zhipu GLM: GET https://open.bigmodel.cn/api/monitor/usage/quota/limit
- *  无 coding plan 时端点返回 500 / code≠0；用裸 API key 当 Authorization value（不加 Bearer） */
-/** Zhipu GLM (zai): GET https://www.bigmodel.cn/api/biz/account/query-customer-account-report
- *  账户现金余额。zai 是余额型配置（pi auth 中选择 zai 时使用）。 */
 export async function fetchZhipuBalance(auth: Auth, signal: AbortSignal): Promise<FetchPayload> {
   const j = await jsonFetch<any>(
     "https://www.bigmodel.cn/api/biz/account/query-customer-account-report",
@@ -393,7 +364,7 @@ export async function fetchZhipuBalance(auth: Auth, signal: AbortSignal): Promis
   }
   const data = j.data;
   if (!data || typeof data !== "object") throw new Error("no Zhipu account data");
-  // availableBalance 是可用的现金余额（充值 − 已用 − 冻结）。
+
   const balance = requiredNumber(data.availableBalance ?? data.balance, "Zhipu available balance");
   return {
     kind: "balance",
@@ -406,9 +377,6 @@ export async function fetchZhipuBalance(auth: Auth, signal: AbortSignal): Promis
   };
 }
 
-/** Zhipu GLM Coding Plan (zai-coding-cn): GET https://open.bigmodel.cn/api/monitor/usage/quota/limit
- *  Coding Plan 订阅配额。zai-coding-cn 是桶型配置（pi auth 中选择 zai-coding-cn 时使用）；
- *  非订阅账户该端点返回 code=500 "当前用户不存在coding plan"。 */
 export async function fetchZhipuCoding(auth: Auth, signal: AbortSignal): Promise<FetchPayload> {
   const j = await jsonFetch<any>(
     "https://open.bigmodel.cn/api/monitor/usage/quota/limit",
@@ -437,7 +405,6 @@ export async function fetchZhipuCoding(auth: Auth, signal: AbortSignal): Promise
   };
 }
 
-/** DeepSeek: GET https://api.deepseek.com/user/balance */
 export async function fetchDeepseek(auth: Auth, signal: AbortSignal): Promise<FetchPayload> {
   const j = await jsonFetch<any>(
     "https://api.deepseek.com/user/balance",
@@ -448,7 +415,7 @@ export async function fetchDeepseek(auth: Auth, signal: AbortSignal): Promise<Fe
   const info = j.balance_infos?.[0];
   if (!info) throw new Error("no balance");
   const total = requiredNumber(info.total_balance, "DeepSeek balance");
-  // API 返回 currency（CNY/USD），按返回值映射符号
+
   const cur = info.currency;
   const currency = cur === "USD" ? "$" : cur === "CNY" ? "¥" : String(cur ?? "?");
   return {
@@ -462,7 +429,6 @@ export async function fetchDeepseek(auth: Auth, signal: AbortSignal): Promise<Fe
   };
 }
 
-/** OpenRouter: GET https://openrouter.ai/api/v1/credits */
 export async function fetchOpenrouter(auth: Auth, signal: AbortSignal): Promise<FetchPayload> {
   const j = await jsonFetch<any>(
     "https://openrouter.ai/api/v1/credits",
@@ -484,9 +450,6 @@ export async function fetchOpenrouter(auth: Auth, signal: AbortSignal): Promise<
   };
 }
 
-/** OpenCode Go: GET https://opencode.ai/zen/go/v1/usage
- *  接口返回 usage.rolling / weekly / monthly，字段为 status、percent、resetsAt；
- *  兼容 rollingUsage 等旧键名。 */
 export async function fetchOpencodeGo(auth: Auth, signal: AbortSignal): Promise<FetchPayload> {
   const j = await jsonFetch<any>(
     "https://opencode.ai/zen/go/v1/usage",
@@ -560,3 +523,89 @@ export async function fetchOpencodeGo(auth: Auth, signal: AbortSignal): Promise<
   };
 }
 
+const CODEX_JWT_CLAIM_PATH = "https://api.openai.com/auth";
+const CODEX_DEFAULT_BASE = "https://chatgpt.com/backend-api";
+
+export function extractChatGptAccountId(token: string | undefined): string | null {
+  if (typeof token !== "string") return null;
+  const parts = token.split(".");
+  if (parts.length !== 3) return null;
+  try {
+    const payload = JSON.parse(Buffer.from(parts[1] ?? "", "base64").toString("utf8"));
+    const accountId = payload?.[CODEX_JWT_CLAIM_PATH]?.chatgpt_account_id;
+    return typeof accountId === "string" && accountId !== "" ? accountId : null;
+  } catch {
+    return null;
+  }
+}
+
+function codexWindowLabel(windowSeconds: number | null): string {
+  if (windowSeconds === null || !Number.isFinite(windowSeconds) || windowSeconds <= 0) return "5h ";
+  if (windowSeconds >= 86_400) return `${Math.round(windowSeconds / 86_400)}d `;
+  return `${Math.round(windowSeconds / 3_600)}h `;
+}
+
+export async function fetchOpenaiCodex(auth: Auth, signal: AbortSignal): Promise<FetchPayload> {
+  const url = quotaUrl(auth.baseUrl, CODEX_DEFAULT_BASE, "/wham/usage");
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${auth.apiKey}`,
+    Accept: "application/json",
+  };
+  const accountId = extractChatGptAccountId(auth.apiKey);
+  if (accountId) headers["chatgpt-account-id"] = accountId;
+  const j = await jsonFetch<any>(url, headers, 15_000, signal);
+
+  const rateLimit = j?.rate_limit;
+  if (!rateLimit || typeof rateLimit !== "object" || Array.isArray(rateLimit)) {
+    throw new Error("no OpenAI Codex rate_limit");
+  }
+  const windows = [
+    { key: "primary_window", defaultLabel: "5h " },
+    { key: "secondary_window", defaultLabel: "7d " },
+  ] as const;
+  const items: RenderItem[] = [];
+  const metrics: Record<string, number> = {};
+  const resetAt: Record<string, number> = {};
+  let pushed = 0;
+  let planText = "";
+  const planType = j?.plan_type;
+
+  if (typeof planType === "string") {
+    const safePlanType = planType.trim();
+    if (/^[A-Za-z0-9][A-Za-z0-9 _-]{0,31}$/.test(safePlanType)) {
+      planText = ` (${safePlanType})`;
+    }
+  }
+
+  for (const w of windows) {
+    const win = rateLimit[w.key];
+    if (!win || typeof win !== "object" || Array.isArray(win)) continue;
+    const pct = requiredPercent(win.used_percent, `OpenAI Codex ${w.key} used_percent`);
+    const seconds = finiteNumber(win.limit_window_seconds);
+    const label = seconds !== null ? codexWindowLabel(seconds) : w.defaultLabel;
+    const resetAtSec = finiteNumber(win.reset_at);
+    const resetAfter = finiteNumber(win.reset_after_seconds);
+    let resetAtMs: number | null = null;
+    if (resetAtSec !== null && resetAtSec > 0) {
+      const ms = resetAtSec * 1000;
+      if (ms > Date.now()) resetAtMs = ms;
+    }
+    if (resetAtMs === null && resetAfter !== null && resetAfter > 0) resetAtMs = Date.now() + resetAfter * 1000;
+    const reset = resetAtMs === null ? "" : seconds !== null && seconds >= 86_400
+      ? formatDays(resetAtMs - Date.now())
+      : formatRemaining(resetAtMs - Date.now());
+    const metric = label.trim();
+    items.push(...tier(items.length === 0 ? "Usage: " : " / ", label, pct, reset));
+    metrics[metric] = pct;
+    if (resetAtMs !== null) resetAt[metric] = resetAtMs;
+    pushed++;
+  }
+  if (pushed === 0) throw new Error("no OpenAI Codex usage windows");
+  if (planText) items.push({ kind: "text", text: planText });
+  return {
+    kind: "quota",
+    items,
+    metrics,
+    resetAt: Object.keys(resetAt).length > 0 ? resetAt : undefined,
+  };
+}

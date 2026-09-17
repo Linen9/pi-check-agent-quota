@@ -1,14 +1,12 @@
-// lib/widget.ts
-// 渲染 + 组件 + i18n + ANSI 工具。纯函数，零 providers 依赖。
-
 import type { Theme } from "@earendil-works/pi-coding-agent";
 
 export type RenderItem =
   | { kind: "text"; text: string }
   | { kind: "pct"; pct: number; metric?: string }
   | { kind: "balance"; value: number; currency: string; metric?: string }
-  | { kind: "annotation"; text: string };
-
+  | { kind: "annotation"; text: string }
+  | { kind: "age"; text: string }
+  | { kind: "eta"; text: string };
 
 export type Language = "zh" | "en";
 
@@ -29,7 +27,21 @@ export type Locale = {
   checkaqDescription: string;
   aq10Description: string;
   aqlangDescription: string;
+  aqsetDescription: string;
+  aqsetUsage: string;
+  aqsetShow: (s: { pctYellow: number; pctRed: number; balanceAlert: number }) => string;
+  aqsetApplied: (s: { pctYellow: number; pctRed: number; balanceAlert: number }) => string;
+  aqsetReset: string;
+  aqautoDescription: string;
+  aqautoUsage: string;
+  aqautoStatusOn: (minutes: number) => string;
+  aqautoStatusOff: string;
+  aqautoEnabled: (minutes: number) => string;
+  aqautoDisabled: string;
   etaZeroRounds: (count: number) => string;
+  etaRoundsOnly: (rounds: string) => string;
+  etaWithTime: (rounds: string, time: string) => string;
+  etaCapped: (max: number) => string;
 };
 
 export const LOCALES: Record<Language, Locale> = {
@@ -50,7 +62,21 @@ export const LOCALES: Record<Language, Locale> = {
     checkaqDescription: "强制刷新限额并显示当前 provider 详情",
     aq10Description: "显示最近 10 轮对话消耗记录",
     aqlangDescription: "切换界面语言（zh/en）",
+    aqsetDescription: "查看/设置显示阈值：/aqset <红> <黄> <余额告警>，无参数查看",
+    aqsetUsage: "用法：/aqset <红阈值> <黄阈值> <余额告警>，如 /aqset 80 40 10（红线需大于黄线）",
+    aqsetShow: (s) => `当前阈值：/aqset ${s.pctRed} ${s.pctYellow} ${s.balanceAlert}（红色≥${s.pctRed} 黄色≥${s.pctYellow} 余额≤${s.balanceAlert}）`,
+    aqsetApplied: (s) => `已设置：红色≥${s.pctRed} 黄色≥${s.pctYellow} 余额≤${s.balanceAlert}，立即生效并持久化`,
+    aqsetReset: "已恢复默认阈值",
+    aqautoDescription: "查看/开关挂机自动抓取：/aqauto <分钟>|on|off（间隔 0-30，0=关闭）",
+    aqautoUsage: "用法：/aqauto <分钟数>|on|off，间隔 0-30 分钟（0=关闭，30 为上限），如 /aqauto 4",
+    aqautoStatusOn: (minutes) => `自动抓取：每 ${minutes} 分钟一次`,
+    aqautoStatusOff: "自动抓取：关闭",
+    aqautoEnabled: (minutes) => `已开启：每 ${minutes} 分钟自动抓取，立即生效并持久化`,
+    aqautoDisabled: "已关闭自动抓取，立即生效并持久化",
     etaZeroRounds: (count) => ` 预计可用：近${count}轮0消耗`,
+    etaRoundsOnly: (rounds) => ` 预计可用：${rounds}轮`,
+    etaWithTime: (rounds, time) => ` 预计可用：${rounds}轮/${time}`,
+    etaCapped: (max) => ` 预计可用：${max}+轮`,
   },
   en: {
     usage: "Usage",
@@ -69,7 +95,21 @@ export const LOCALES: Record<Language, Locale> = {
     checkaqDescription: "Force-refresh quota and show detailed widget for current provider",
     aq10Description: "Show the last 10 conversation consumption records",
     aqlangDescription: "Switch interface language (zh/en)",
+    aqsetDescription: "View/set display thresholds: /aqset <red> <yellow> <balance alert>, no args to view",
+    aqsetUsage: "Usage: /aqset <red> <yellow> <balanceAlert>, e.g. /aqset 80 40 10 (red must be above yellow)",
+    aqsetShow: (s) => `Current: /aqset ${s.pctRed} ${s.pctYellow} ${s.balanceAlert} (red ≥${s.pctRed}, yellow ≥${s.pctYellow}, balance ≤${s.balanceAlert})`,
+    aqsetApplied: (s) => `Set: red ≥${s.pctRed}, yellow ≥${s.pctYellow}, balance ≤${s.balanceAlert}, effective immediately and persisted`,
+    aqsetReset: "Thresholds reset to defaults",
+    aqautoDescription: "View/toggle idle auto refresh: /aqauto <minutes>|on|off (0-30, 0 = off)",
+    aqautoUsage: "Usage: /aqauto <minutes>|on|off, interval 0-30 minutes (0 = off, 30 = max), e.g. /aqauto 4",
+    aqautoStatusOn: (minutes) => `Auto refresh: every ${minutes} minutes`,
+    aqautoStatusOff: "Auto refresh: off",
+    aqautoEnabled: (minutes) => `Enabled: auto refresh every ${minutes} minutes, effective immediately and persisted`,
+    aqautoDisabled: "Auto refresh disabled, effective immediately and persisted",
     etaZeroRounds: (count) => ` Available: 0 used in last ${count} rounds`,
+    etaRoundsOnly: (rounds) => ` Available: ${rounds} rounds`,
+    etaWithTime: (rounds, time) => ` Available: ${rounds} rounds / ${time}`,
+    etaCapped: (max) => ` Available: ${max}+ rounds`,
   },
 };
 
@@ -77,18 +117,82 @@ export function normalizeLanguage(value: unknown): Language | null {
   return value === "zh" || value === "en" ? value : null;
 }
 
-type DiskCache = {
-  version: 2;
-  language?: Language;
-  active_round?: ActiveRound;
-  providers: Record<string, ProviderCache>;
+const MISSING = "--";
+
+export type QuotaSettings = {
+  pctYellow: number;
+  pctRed: number;
+  balanceAlert: number;
+  autoRefreshMinutes: number;
 };
 
-const MISSING = "--";
-const BALANCE_ALERT = (() => {
-  const raw = Number(process.env.PI_QUOTA_BALANCE_ALERT);
-  return Number.isFinite(raw) && raw > 0 ? raw : 10;
-})();
+function envNum(name: string, fallback: number, min: number, max: number): number {
+  const raw = Number(process.env[name]);
+  if (!Number.isFinite(raw) || raw <= min || raw >= max) return fallback;
+  return raw;
+}
+
+export const AUTO_REFRESH_MAX_MINUTES = 30;
+
+function computeSettingsDefaults(): QuotaSettings {
+  const pctYellow = envNum("PI_QUOTA_PCT_YELLOW", 40, 0, 100);
+  const configuredRed = envNum("PI_QUOTA_PCT_RED", 80, 0, 100);
+
+  const pctRed = configuredRed > pctYellow ? configuredRed : 80;
+  const safeYellow = pctRed > pctYellow ? pctYellow : 40;
+  return {
+    pctYellow: safeYellow,
+    pctRed,
+    balanceAlert: envNum("PI_QUOTA_BALANCE_ALERT", 10, 0, Number.MAX_SAFE_INTEGER),
+
+    autoRefreshMinutes: Math.min(
+      AUTO_REFRESH_MAX_MINUTES,
+      Math.max(0, envNum("PI_QUOTA_AUTO_REFRESH_MINUTES", 0, 0, Number.MAX_SAFE_INTEGER)),
+    ),
+  };
+}
+
+export const QUOTA_SETTINGS_DEFAULTS: Readonly<QuotaSettings> = computeSettingsDefaults();
+
+let _quotaSettings: QuotaSettings = computeSettingsDefaults();
+
+export function getQuotaSettings(): Readonly<QuotaSettings> {
+  return _quotaSettings;
+}
+
+export function setQuotaSettings(patch: Partial<QuotaSettings>): Readonly<QuotaSettings> {
+  const next = { ..._quotaSettings };
+  if (patch.pctYellow !== undefined && Number.isFinite(patch.pctYellow) && patch.pctYellow > 0 && patch.pctYellow < 100) {
+    next.pctYellow = patch.pctYellow;
+  }
+  if (patch.pctRed !== undefined && Number.isFinite(patch.pctRed) && patch.pctRed > 0 && patch.pctRed < 100) {
+    next.pctRed = patch.pctRed;
+  }
+  if (patch.balanceAlert !== undefined && Number.isFinite(patch.balanceAlert) && patch.balanceAlert > 0) {
+    next.balanceAlert = patch.balanceAlert;
+  }
+  if (patch.autoRefreshMinutes !== undefined && Number.isFinite(patch.autoRefreshMinutes)) {
+
+    next.autoRefreshMinutes = Math.min(AUTO_REFRESH_MAX_MINUTES, Math.max(0, Math.round(patch.autoRefreshMinutes)));
+  }
+
+  if (next.pctRed > next.pctYellow) {
+    _quotaSettings = next;
+  } else {
+    _quotaSettings = {
+      ...next,
+      pctRed: _quotaSettings.pctRed,
+      pctYellow: _quotaSettings.pctYellow,
+    };
+  }
+  return _quotaSettings;
+}
+
+export function resetQuotaSettings(): Readonly<QuotaSettings> {
+
+  _quotaSettings = computeSettingsDefaults();
+  return _quotaSettings;
+}
 
 export const QUOTA_COLORS = {
   green: "#1FA87A",
@@ -97,8 +201,6 @@ export const QUOTA_COLORS = {
   consumption: "#7A5FD0",
 } as const;
 
-
-// widget 私有语言状态，由 index.ts 通过 setCurrentLanguage 注入
 let _currentLanguage: Language = "zh";
 export function setCurrentLanguage(lang: Language) { _currentLanguage = lang; }
 export function getCurrentLanguage(): Language { return _currentLanguage; }
@@ -110,32 +212,56 @@ export function hexFg(hex: string, text: string): string {
   return `\x1b[38;2;${r};${g};${b}m${text}\x1b[39m`;
 }
 
-// 上色前由 clampPct 把 NaN/负值钳制到 [0,100]。
-export function pctColor(pct: number): string {
+export function pctColor(pct: number, _theme?: Theme): string {
   const safe = clampPct(pct);
   const rounded = `${Math.round(safe)}%`;
-  if (safe >= 80) return hexFg(QUOTA_COLORS.red, rounded);
-  if (safe >= 41) return hexFg(QUOTA_COLORS.yellow, rounded);
+  const settings = getQuotaSettings();
+  if (safe >= settings.pctRed) return hexFg(QUOTA_COLORS.red, rounded);
+  if (safe >= settings.pctYellow) return hexFg(QUOTA_COLORS.yellow, rounded);
   return hexFg(QUOTA_COLORS.green, rounded);
 }
 
 export function balanceColor(value: number, currency: string, theme: Theme): string {
   const safe = Number.isFinite(value) && value !== 0 ? value : 0;
-  if (safe <= BALANCE_ALERT) return hexFg(QUOTA_COLORS.red, `${currency}${safe.toFixed(2)}`);
+  if (safe <= getQuotaSettings().balanceAlert) return hexFg(QUOTA_COLORS.red, `${currency}${safe.toFixed(2)}`);
   return theme.fg("dim", `${currency}${safe.toFixed(2)}`);
+}
+
+export function formatAge(fetchedAt: number): string {
+  const ageMs = Date.now() - fetchedAt;
+  if (!Number.isFinite(ageMs) || ageMs < 0) return "";
+  if (ageMs < 60_000) return _currentLanguage === "zh" ? "刚刚" : "now";
+
+  const totalMin = Math.floor(ageMs / 60000);
+  const h = Math.floor(totalMin / 60);
+  const m = totalMin % 60;
+  const totalH = Math.floor(ageMs / 3_600_000);
+  const d = Math.floor(totalH / 24);
+  const hRem = totalH % 24;
+  const mo = Math.floor(d / 30);
+  const dRem = d % 30;
+  if (_currentLanguage === "zh") {
+    if (mo > 0) return dRem > 0 ? `${mo}个月${dRem}天前` : `${mo}个月前`;
+    if (d > 0) return hRem > 0 ? `${d}天${hRem}小时前` : `${d}天前`;
+    if (h > 0) return m > 0 ? `${h}小时${m}分钟前` : `${h}小时前`;
+    return `${m}分钟前`;
+  } else {
+    if (mo > 0) return dRem > 0 ? `${mo}mo${dRem}d ago` : `${mo}mo ago`;
+    if (d > 0) return hRem > 0 ? `${d}d${hRem}h ago` : `${d}d ago`;
+    if (h > 0) return m > 0 ? `${h}h${m}m ago` : `${h}h ago`;
+    return `${m}m ago`;
+  }
 }
 
 export function formatItems(items: RenderItem[], theme: Theme): string {
   return items
     .map((it) => {
       if (it.kind === "text") return theme.fg("dim", localizeText(it.text));
-      if (it.kind === "pct") return pctColor(it.pct);
+      if (it.kind === "pct") return pctColor(it.pct, theme);
       if (it.kind === "balance") return balanceColor(it.value, it.currency, theme);
+      if (it.kind === "eta") return theme.fg("dim", localizeText(it.text));
+      if (it.kind === "age") return theme.fg("dim", it.text);
       const text = localizeText(it.text);
-      // ETA 基色跟随“限额”二字（dim），仅紧急片段已在 formatEta 中标红
-      if (text.includes("预计可用") || text.includes("Available:")) {
-        return theme.fg("dim", text);
-      }
       return hexFg(QUOTA_COLORS.consumption, text);
     })
     .join("");
@@ -175,7 +301,6 @@ export function localizeText(text: string): string {
   return text;
 }
 
-// 把差值注释注入到 pct / balance 项之后。
 export function annotateItems(
   items: RenderItem[],
   annotationFor: (item: Extract<RenderItem, { kind: "pct" | "balance" }>) => string | undefined,
@@ -192,8 +317,6 @@ export function annotateItems(
   return out;
 }
 
-// 桶型配额：`Usage: 5h X% (4h52m)` / ` / 7d X% (4d23h)`
-// prefix="Usage: " 给首桶；prefix=" / " 给后续桶（自动拼上 "7d " 这种 label）
 export function tier(prefix: string, label: string, pct: number, reset: string): RenderItem[] {
   return [
     { kind: "text", text: prefix + label },
@@ -210,9 +333,6 @@ export function emptyItems(): RenderItem[] {
   return [];
 }
 
-
-// 自实现 Component：只 render() 和 invalidate()。
-
 export interface Component {
   render(width: number): string[];
   invalidate(): void;
@@ -220,7 +340,7 @@ export interface Component {
 }
 
 export class QuotaComponent implements Component {
-  private cache: { width: number; lines: string[] } | null = null;
+  private cache: { width: number; language: Language; theme: Theme | null; lines: string[] } | null = null;
   private items: RenderItem[];
   private readonly themeRef: () => Theme;
   private readonly requestRender: () => void;
@@ -247,39 +367,53 @@ export class QuotaComponent implements Component {
   }
 
   render(width: number): string[] {
-    if (this.cache && this.cache.width === width) return this.cache.lines;
-    // 左右贴边：左区（配额）贴左，右区（ETA）贴右；窄窗口换行
-    const etaIdx = this.items.findIndex((it) => it.kind === "annotation" && it.text.includes("预计可用"));
-    // 兼容英文：也检测 "Available:"
-    const etaIdxEn = etaIdx === -1 ? this.items.findIndex((it) => it.kind === "annotation" && it.text.includes("Available:")) : -1;
-    const splitIdx = etaIdx !== -1 ? etaIdx : etaIdxEn;
+    const curTheme = this.themeRef();
+    const curLang = _currentLanguage;
+    if (this.cache && this.cache.width === width && this.cache.language === curLang && this.cache.theme === curTheme) return this.cache.lines;
+
+    const splitIdx = this.items.findIndex((it) => it.kind === "age" || it.kind === "eta");
     if (splitIdx === -1) {
-      const text = formatItems(this.items, this.themeRef());
+      const text = formatItems(this.items, curTheme);
       const lines = text ? [truncateAnsi(text, width)] : [];
-      this.cache = { width, lines };
+      this.cache = { width, language: curLang, theme: curTheme, lines };
       return lines;
     }
     const leftItems = this.items.slice(0, splitIdx);
-    const rightItems = this.items.slice(splitIdx);
-    const left = formatItems(leftItems, this.themeRef());
-    const right = formatItems(rightItems, this.themeRef());
+    const rightItemsFull = this.items.slice(splitIdx);
+    const left = formatItems(leftItems, curTheme);
+    const rightFull = formatItems(rightItemsFull, curTheme);
     const lw = visibleWidth(left);
-    const rw = visibleWidth(right);
-    if (lw + rw + 1 <= width) {
-      const pad = " ".repeat(width - lw - rw);
-      const lines = [left + pad + right];
-      this.cache = { width, lines };
-      return lines;
-    } else {
-      // 窄窗口：左区一行，ETA 单独一行（右贴边）
-      const line1 = left ? truncateAnsi(left, width) : "";
-      const pad2 = " ".repeat(Math.max(0, width - rw));
-      const line2 = rw <= width ? pad2 + right : truncateAnsi(right, width);
-      const lines = line1 ? [line1, line2] : [line2];
-      // 截断 lines 到 MAX 10 行以内（当前最多 2 行）
-      this.cache = { width, lines };
+    const rwFull = visibleWidth(rightFull);
+    if (lw + rwFull + 1 <= width) {
+      const pad = " ".repeat(width - lw - rwFull);
+      const lines = [left + pad + rightFull];
+      this.cache = { width, language: curLang, theme: curTheme, lines };
       return lines;
     }
+
+    let right = rightFull;
+    let rw = rwFull;
+    const hasAge = rightItemsFull.some((it) => it.kind === "age");
+    if (width < 60 && hasAge) {
+      const stripped = rightItemsFull.filter((it) => it.kind !== "age");
+      const rightStripped = formatItems(stripped, curTheme);
+      const rwStripped = visibleWidth(rightStripped);
+      if (lw + rwStripped + 1 <= width) {
+        const pad = " ".repeat(width - lw - rwStripped);
+        const lines = [left + pad + rightStripped];
+        this.cache = { width, language: curLang, theme: curTheme, lines };
+        return lines;
+      }
+      right = rightStripped;
+      rw = rwStripped;
+    }
+
+    const line1 = left ? truncateAnsi(left, width) : "";
+    const pad2 = " ".repeat(Math.max(0, width - rw));
+    const line2 = rw <= width ? pad2 + right : truncateAnsi(right, width);
+    const lines = line1 ? [line1, line2] : [line2];
+    this.cache = { width, language: curLang, theme: curTheme, lines };
+    return lines;
   }
 
   invalidate(): void {
@@ -313,10 +447,13 @@ export function renderItemsEqual(a: RenderItem[], b: RenderItem[]): boolean {
             ? item.value === other.value && item.currency === other.currency && item.metric === other.metric
             : item.kind === "annotation" && other.kind === "annotation"
               ? item.text === other.text
-              : false);
+              : item.kind === "age" && other.kind === "age"
+                ? item.text === other.text
+                : item.kind === "eta" && other.kind === "eta"
+                  ? item.text === other.text
+                  : false);
   });
 }
-
 
 export function sanitizeMs(ms: unknown): number | null {
   const n = Number(ms);
@@ -341,7 +478,6 @@ export function formatDays(ms: unknown): string {
   return `${d}d${h}h`;
 }
 
-// 钳制到 [0,100]；NaN/非数字归零，避免异常值显示成低用量绿。
 export function clampPct(pct: unknown): number {
   const n = Number(pct);
   if (!Number.isFinite(n)) return 0;
@@ -355,18 +491,14 @@ export function usedPct(limit: unknown, remaining: unknown): number {
   return clampPct(((lim - rem) / lim) * 100);
 }
 
-// ---------- ANSI 宽度裁剪 ----------
-// 扩展无法 import pi-tui，因此自实现单行截断。
-
 export const ANSI_RE = /\x1b\[[0-9;]*m/g;
 
-// 可见宽度：剥掉 SGR 序列后按 Unicode 宽度计列：东亚宽字符 2 列，零宽/组合字符 0 列，其余 1 列。
 export function visibleWidth(s: string): number {
   let w = 0;
   for (const ch of s.replace(ANSI_RE, "")) {
     const cp = ch.codePointAt(0) ?? 0;
-    if (cp === 0x200d || (cp >= 0xfe00 && cp <= 0xfe0f)) continue; // ZWJ / VS
-    if (cp >= 0x0300 && cp <= 0x036f) continue; // 组合音标
+    if (cp === 0x200d || (cp >= 0xfe00 && cp <= 0xfe0f)) continue;
+    if (cp >= 0x0300 && cp <= 0x036f) continue;
     w +=
       (cp >= 0x1100 && cp <= 0x115f) ||
       (cp >= 0x2e80 && cp <= 0xa4cf) ||
@@ -382,13 +514,12 @@ export function visibleWidth(s: string): number {
   return w;
 }
 
-// 按可见宽度截断，保留 ANSI 序列（不计入宽度），末尾补 SGR reset 防止样式外溢。
 export function truncateAnsi(s: string, maxWidth: number): string {
   if (maxWidth <= 0) return "";
   if (visibleWidth(s) <= maxWidth) return s;
 
   const ELLIPSIS = "…";
-  const budget = maxWidth - 1; // 给省略号留一列
+  const budget = maxWidth - 1;
   let out = "";
   let w = 0;
   let i = 0;
@@ -397,7 +528,7 @@ export function truncateAnsi(s: string, maxWidth: number): string {
     ANSI_RE.lastIndex = i;
     const m = ANSI_RE.exec(s);
     if (m && m.index === i) {
-      out += m[0]; // ANSI 序列原样保留，不占宽度
+      out += m[0];
       i = ANSI_RE.lastIndex;
       continue;
     }
