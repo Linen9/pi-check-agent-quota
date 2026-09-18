@@ -2,7 +2,7 @@
 
 Display AI provider quota and balance, plus consumption of recent dialogue rounds in the pi TUI.
 
-English | [中文说明](./README_CN.md)
+English | [中文说明](./README.md)
 
 ![widget preview](https://raw.githubusercontent.com/Linen9/pi-check-agent-quota/main/assets/screenshot-en.png)
 

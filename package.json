@@ -27,7 +27,7 @@
   "type": "module",
   "files": [
     "extensions",
-    "README_CN.md",
+    "README.md",
     "README_EN.md"
   ],
   "engines": {
