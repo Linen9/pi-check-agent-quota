@@ -1,6 +1,6 @@
 # pi-check-agent-quota
 
-在 pi TUI 中显示 AI provider 的配额、余额，以及最近几轮对话的消耗。
+在 pi TUI 中显示 AI provider 的配额、余额和最近几轮对话消耗，并可按实时配额选择 provider/model。
 
 [English](./README_EN.md) | 中文说明
 
@@ -68,30 +68,31 @@ API key 复用 pi 已有的 provider 认证，无需额外配置。
   - 超过 365 轮 → `365+轮`
   - 剩余 ≤5 轮或 ≤30 分钟 → 数字标红
 - **布局**：窄窗口自动换行，拖拉窗口自动重算贴边；时间精确到分（`2h15m`），≥24h 换算成天（`3d4h`）。
-- **刷新时间**：有 ETA 时，`2分钟前 ·`（en: `2m ago ·`）显示在「预计可用」前；没有 ETA 时只显示 `2分钟前`（en: `2m ago`），表示当前配额快照抓取于 2 分钟前。定义：`age = 当前时间 − 该 provider 最近一次成功抓取时间`（抓取由会话启动、切换模型、每轮结算、`/checkaq` 触发；会话恢复时可能来自磁盘缓存，会如实显示如 `5小时前`）。闲置时每分钟自动重算；age 与 ETA 独立，ETA 不可用时（窗口耗尽/窄窗/样本不足）仍显示；抓取失败后也显示最近一次成功快照的 age。
-- **自动刷新（可选，默认关闭）**：用 `/aqauto 5` 开启（每 5 分钟）、`/aqauto on`（默认 5 分钟）、`/aqauto off` 关闭、`/aqauto` 查看。开启后 pi 挂着不用也会按间隔自动抓取（纯监控用途，无需对话）；手动 `/checkaq` 和每轮结算照常工作，并会推迟下一次自动抓取。设置与阈值一样持久化；环境变量 `PI_QUOTA_AUTO_REFRESH_MINUTES` 仍可作为初始值。
+- **刷新时间**：有 ETA 时，`2分钟前 ·`（en: `2m ago ·`）显示在「预计可用」前；没有 ETA 时只显示 `2分钟前`（en: `2m ago`），表示当前配额快照抓取于 2 分钟前。定义：`age = 当前时间 − 该 provider 最近一次成功抓取时间`（抓取由会话启动、切换模型、每轮结算、`/aqcheck` 触发；会话恢复时可能来自磁盘缓存，会如实显示如 `5小时前`）。闲置时每分钟自动重算；age 与 ETA 独立，ETA 不可用时（窗口耗尽/窄窗/样本不足）仍显示；抓取失败后也显示最近一次成功快照的 age。
+- **自动刷新（可选，默认关闭）**：用 `/aqauto 5` 开启（每 5 分钟）、`/aqauto 0` 关闭、`/aqauto` 查看。开启后 pi 挂着不用也会按间隔自动抓取（纯监控用途，无需对话）；手动 `/aqcheck` 和每轮结算照常工作，并会推迟下一次自动抓取。设置与阈值一样持久化；环境变量 `PI_QUOTA_AUTO_REFRESH_MINUTES` 仍可作为初始值。
 
 ## 命令
 
 | 命令 | 用法 | 说明 |
 |---|---|---|
-| `/checkaq` | `/checkaq` | 强制刷新并显示当前 provider 的实时配额 |
+| `/aqcheck` | `/aqcheck` | 强制刷新并显示当前 provider 的实时配额 |
 | `/aq10` | `/aq10` | 显示最近 10 条已结算轮次的消耗汇总 |
 | `/aqlang` | `/aqlang zh\|en` | 切换界面语言（默认中文） |
 | `/aqset` | `/aqset [红 黄 余额] \| reset` | 查看/设置显示阈值 |
-| `/aqauto` | `/aqauto [分钟\|on\|off]` | 查看/开关挂机自动抓取 |
+| `/aqauto` | `/aqauto [分钟]` | 查看/设置挂机自动抓取，`0` 关闭 |
+| `/aqpick` | `/aqpick` | 现场刷新配额并按 provider 选择模型 |
 
-### `/checkaq` — 强制刷新
+### `/aqcheck` — 强制刷新
 
 用法：
 
 ```text
-/checkaq
+/aqcheck
 ```
 
 - 不需要参数（多余文本会被忽略），始终请求当前 provider 的实时配额，不依赖缓存；
 - 使用当前 provider 配置的 API key 或 pi 管理的 OAuth 凭据；
-- 成功后更新 Widget、`age` 和 ETA，但单独执行 `/checkaq` 不会创建消耗记录；
+- 成功后更新 Widget、`age` 和 ETA，但单独执行 `/aqcheck` 不会创建消耗记录；
 - 同 provider 已有请求在途时会等待并复用该请求；同 provider 在 1 秒内重复执行会防抖；
 - 没有当前 provider 时提示警告；未支持或未配置 provider 保持 `--`/限额不可用。
 
@@ -153,6 +154,25 @@ openrouter 近5轮消耗 $0.69
 - 设置立即生效并跨会话持久化（存在本地缓存文件里）；
 - 旧环境变量 `PI_QUOTA_PCT_YELLOW` / `PI_QUOTA_PCT_RED` / `PI_QUOTA_BALANCE_ALERT` 仍可作为初始值。
 
+### `/aqpick` — 按实时配额选择模型
+
+用法：
+
+```text
+/aqpick
+```
+
+- 不接受参数；每次执行都会现场刷新候选 provider，不使用旧快照作为选择依据；
+- 候选来自 pi 当前允许选择的模型范围；只查询并显示已认证且受本扩展支持的 provider；
+- 候选 provider 会同时发起现场查询，每个 provider 只尝试一次；总等待上限为 10 秒，抓取失败、超时或未认证的 provider 不进入列表；未选中的候选配额只保留在当次内存中，不写入本地缓存；
+- 百分比型 provider 显示各窗口的**已用百分比和重置倒计时**，余额型 provider 显示余额；
+- 当前 provider 固定置顶，其余按显示名称排序；先选择 provider，再选择该 provider 下的模型；若只有一个可选模型则直接切换；
+- `Esc` 取消时不改变模型；切换失败时保留当前模型；
+- 切换通过 pi 官方 `pi.setModel()` 完成，不修改认证配置，不自动发送消息，也不触发模型请求；
+- 与 pi 原生 `/model` 一样，跨 provider 切换后，**下一轮对话上下文会由 pi 正常发送给新 provider**。
+
+![aqpick 预览](https://raw.githubusercontent.com/Linen9/pi-check-agent-quota/main/assets/aqpick.png)
+
 ### `/aqauto` — 挂机自动抓取
 
 默认关闭；开启后即使不对话，也按设定间隔自动抓取配额：
@@ -161,15 +181,14 @@ openrouter 近5轮消耗 $0.69
 /aqauto               # 查看当前状态（如：自动抓取：每 5 分钟一次）
 /aqauto 4             # 开启，每 4 分钟
 /aqauto 30            # 最大间隔
-/aqauto on            # 开启（保持当前间隔，未设置时默认 5 分钟）
-/aqauto off           # 关闭（等同 /aqauto 0）
+/aqauto 0             # 关闭
 ```
 
 规则：
 
-- 间隔只接受整数，范围 0–30 分钟：`0` = 关闭，`30` = 上限；小数和超过 30 的值直接拒绝；
+- 间隔只接受整数，范围 0–30 分钟：`0` = 关闭，`1–30` = 开启并设置分钟间隔；`on`、`off`、小数、负数、多参数和超过 30 的值直接拒绝；
 - 立即生效并跨会话持久化（与 `/aqset` 一样存在本地缓存文件里）；
-- 防抖：1 秒内重复同一命令忽略；任何一次抓取（手动 `/checkaq`、每轮结算、会话启动）都会推迟下一次自动抓取；同 provider 在途请求合并不重复；
+- 防抖：1 秒内重复同一命令忽略；任何一次抓取（手动 `/aqcheck`、每轮结算、会话启动）都会推迟下一次自动抓取；同 provider 在途请求合并不重复；
 - `/aqset reset` 会连自动抓取一起重置回环境变量初始值（或关闭）；
 - 旧环境变量 `PI_QUOTA_AUTO_REFRESH_MINUTES` 仍可作为初始值（超过 30 钳制到 30）。
 
@@ -203,8 +222,9 @@ mv ~/.pi/agent/pi-check-agent-quota.json ~/.pi/agent/pi-check-agent-quota/quota-
 - 只向对应 provider 的配额接口发送该 provider 的凭据（API key 或 OAuth access token，后者由 pi 管理与续期，本扩展不落盘、不日志）；
 - 不读取、不上传 prompt、回复、文件或对话内容；不保存 API key 和完整响应；无遥测；
 - 本地缓存位于 `~/.pi/agent/pi-check-agent-quota/quota-cache.json`，仅当前用户可读写；
-- 自定义 `baseUrl` 仅允许 HTTPS（本机回环可用 HTTP），请求不跟随重定向；
-- 默认只在用户可见事件时抓取（会话启动、切换模型、每轮结算、`/checkaq`）；若通过 `/aqauto` 开启自动刷新，pi 打开期间会按该间隔在后台自动抓取。
+- 自定义 `baseUrl` 仅允许 HTTPS（本机回环可用 HTTP），请求不跟随重定向；配置后，配额凭据只发送到该配置地址而不会再发送到默认官方域名，因此请仅使用你信任的地址；
+- 默认只在用户可见事件时抓取（会话启动、切换模型、每轮结算、`/aqcheck`）；若通过 `/aqauto` 开启自动刷新，pi 打开期间会按该间隔在后台自动抓取；执行 `/aqpick` 时会现场查询当前可选、已认证且受支持的 provider；
+- `/aqpick` 使用 pi 官方模型对象和 `pi.setModel()`，不会自行构造模型请求；未选中的候选配额不落盘；跨 provider 切换后的下一轮上下文发送行为与 pi 原生 `/model` 一致。
 
 ## License
 

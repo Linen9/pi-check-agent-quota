@@ -24,7 +24,7 @@ export type Locale = {
   aq10Rounds: (count: number) => string;
   languageChanged: (language: Language) => string;
   invalidLanguage: string;
-  checkaqDescription: string;
+  aqcheckDescription: string;
   aq10Description: string;
   aqlangDescription: string;
   aqsetDescription: string;
@@ -38,6 +38,18 @@ export type Locale = {
   aqautoStatusOff: string;
   aqautoEnabled: (minutes: number) => string;
   aqautoDisabled: string;
+  aqpickDescription: string;
+  aqpickUsage: string;
+  aqpickRefreshing: string;
+  aqpickProviderPrompt: string;
+  aqpickModelPrompt: (provider: string) => string;
+  aqpickNoProviders: string;
+  aqpickRequiresUi: string;
+  aqpickSwitchFailed: string;
+  aqpickSwitched: (provider: string, model: string) => string;
+  aqpickCurrent: string;
+  aqpickUsed: string;
+  aqpickResetsIn: (time: string) => string;
   etaZeroRounds: (count: number) => string;
   etaRoundsOnly: (rounds: string) => string;
   etaWithTime: (rounds: string, time: string) => string;
@@ -59,7 +71,7 @@ export const LOCALES: Record<Language, Locale> = {
     aq10Rounds: (count) => `近${count}轮消耗`,
     languageChanged: () => "语言已切换为中文",
     invalidLanguage: "语言参数只支持 zh 或 en",
-    checkaqDescription: "强制刷新限额并显示当前 provider 详情",
+    aqcheckDescription: "强制刷新限额并显示当前 provider 详情",
     aq10Description: "显示最近 10 轮对话消耗记录",
     aqlangDescription: "切换界面语言（zh/en）",
     aqsetDescription: "查看/设置显示阈值：/aqset <红> <黄> <余额告警>，无参数查看",
@@ -67,12 +79,24 @@ export const LOCALES: Record<Language, Locale> = {
     aqsetShow: (s) => `当前阈值：/aqset ${s.pctRed} ${s.pctYellow} ${s.balanceAlert}（红色≥${s.pctRed} 黄色≥${s.pctYellow} 余额≤${s.balanceAlert}）`,
     aqsetApplied: (s) => `已设置：红色≥${s.pctRed} 黄色≥${s.pctYellow} 余额≤${s.balanceAlert}，立即生效并持久化`,
     aqsetReset: "已恢复默认阈值",
-    aqautoDescription: "查看/开关挂机自动抓取：/aqauto <分钟>|on|off（间隔 0-30，0=关闭）",
-    aqautoUsage: "用法：/aqauto <分钟数>|on|off，间隔 0-30 分钟（0=关闭，30 为上限），如 /aqauto 4",
+    aqautoDescription: "查看/设置挂机自动抓取：/aqauto <分钟>（0-30，0=关闭）",
+    aqautoUsage: "用法：/aqauto <分钟数>，只接受 0-30 的整数（0=关闭），如 /aqauto 4",
     aqautoStatusOn: (minutes) => `自动抓取：每 ${minutes} 分钟一次`,
     aqautoStatusOff: "自动抓取：关闭",
     aqautoEnabled: (minutes) => `已开启：每 ${minutes} 分钟自动抓取，立即生效并持久化`,
     aqautoDisabled: "已关闭自动抓取，立即生效并持久化",
+    aqpickDescription: "现场刷新配额并按 provider 选择模型",
+    aqpickUsage: "用法：/aqpick（不接受参数）",
+    aqpickRefreshing: "正在刷新可选 provider 的配额…",
+    aqpickProviderPrompt: "选择 provider（实时配额）",
+    aqpickModelPrompt: (provider) => `选择 ${provider} 的模型`,
+    aqpickNoProviders: "没有获取到可选 provider 的实时配额",
+    aqpickRequiresUi: "/aqpick 需要可交互界面",
+    aqpickSwitchFailed: "模型切换失败，当前模型未改变",
+    aqpickSwitched: (provider, model) => `已切换至 ${provider}/${model}`,
+    aqpickCurrent: "当前",
+    aqpickUsed: "已用",
+    aqpickResetsIn: (time) => `${time}后重置`,
     etaZeroRounds: (count) => ` 预计可用：近${count}轮0消耗`,
     etaRoundsOnly: (rounds) => ` 预计可用：${rounds}轮`,
     etaWithTime: (rounds, time) => ` 预计可用：${rounds}轮/${time}`,
@@ -92,7 +116,7 @@ export const LOCALES: Record<Language, Locale> = {
     aq10Rounds: (count) => `last ${count} rounds`,
     languageChanged: (language) => `Language switched to ${language === "zh" ? "Chinese" : "English"}`,
     invalidLanguage: "Language must be zh or en",
-    checkaqDescription: "Force-refresh quota and show detailed widget for current provider",
+    aqcheckDescription: "Force-refresh quota and show detailed widget for current provider",
     aq10Description: "Show the last 10 conversation consumption records",
     aqlangDescription: "Switch interface language (zh/en)",
     aqsetDescription: "View/set display thresholds: /aqset <red> <yellow> <balance alert>, no args to view",
@@ -100,12 +124,24 @@ export const LOCALES: Record<Language, Locale> = {
     aqsetShow: (s) => `Current: /aqset ${s.pctRed} ${s.pctYellow} ${s.balanceAlert} (red ≥${s.pctRed}, yellow ≥${s.pctYellow}, balance ≤${s.balanceAlert})`,
     aqsetApplied: (s) => `Set: red ≥${s.pctRed}, yellow ≥${s.pctYellow}, balance ≤${s.balanceAlert}, effective immediately and persisted`,
     aqsetReset: "Thresholds reset to defaults",
-    aqautoDescription: "View/toggle idle auto refresh: /aqauto <minutes>|on|off (0-30, 0 = off)",
-    aqautoUsage: "Usage: /aqauto <minutes>|on|off, interval 0-30 minutes (0 = off, 30 = max), e.g. /aqauto 4",
+    aqautoDescription: "View/set idle auto refresh: /aqauto <minutes> (0-30, 0 = off)",
+    aqautoUsage: "Usage: /aqauto <minutes>; accepts integers from 0 to 30 only (0 = off), e.g. /aqauto 4",
     aqautoStatusOn: (minutes) => `Auto refresh: every ${minutes} minutes`,
     aqautoStatusOff: "Auto refresh: off",
     aqautoEnabled: (minutes) => `Enabled: auto refresh every ${minutes} minutes, effective immediately and persisted`,
     aqautoDisabled: "Auto refresh disabled, effective immediately and persisted",
+    aqpickDescription: "Refresh live quotas and choose a model by provider",
+    aqpickUsage: "Usage: /aqpick (no arguments)",
+    aqpickRefreshing: "Refreshing quota for selectable providers…",
+    aqpickProviderPrompt: "Choose provider (live quota)",
+    aqpickModelPrompt: (provider) => `Choose a model from ${provider}`,
+    aqpickNoProviders: "No selectable provider returned live quota",
+    aqpickRequiresUi: "/aqpick requires an interactive UI",
+    aqpickSwitchFailed: "Model switch failed; current model was not changed",
+    aqpickSwitched: (provider, model) => `Switched to ${provider}/${model}`,
+    aqpickCurrent: "current",
+    aqpickUsed: "used",
+    aqpickResetsIn: (time) => `resets in ${time}`,
     etaZeroRounds: (count) => ` Available: 0 used in last ${count} rounds`,
     etaRoundsOnly: (rounds) => ` Available: ${rounds} rounds`,
     etaWithTime: (rounds, time) => ` Available: ${rounds} rounds / ${time}`,

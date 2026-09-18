@@ -1,6 +1,7 @@
 import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
-import { chmodSync, readFileSync } from "node:fs";
-import { chmod, mkdir, rename, writeFile } from "node:fs/promises";
+import { closeSync, constants as fsConstants, fchmodSync, fstatSync, openSync, readFileSync } from "node:fs";
+import { chmod, lstat, mkdir, open, rename, unlink } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { fetchProviderQuota, isUnProvider, normalizeProvider, fetchWithRetry } from "./lib/providers.js";
@@ -9,21 +10,32 @@ import { LOCALES, QUOTA_COLORS, hexFg, formatRemaining, formatDays, clampPct, an
 import { estimateEta, medianGapMs, ETA_MAX_ROUNDS, RATE_METRIC_PRIORITY, type EtaSample, type EtaEstimate } from "./lib/eta.js";
 
 const STATUS_KEY = "pi-quota";
-const CMD_NAME = "checkaq";
+const AQCHECK_CMD_NAME = "aqcheck";
 const AQ10_CMD_NAME = "aq10";
 const AQLANG_CMD_NAME = "aqlang";
 const AQSET_CMD_NAME = "aqset";
 const AQAUTO_CMD_NAME = "aqauto";
+const AQPICK_CMD_NAME = "aqpick";
 
 const AGENT_START_REFRESH_AFTER_MS = 60 * 60_000;
 const AGENT_START_FETCH_TIMEOUT_MS = 3_000;
-const CHECKAQ_THROTTLE_MS = 1_000;
+const AQCHECK_THROTTLE_MS = 1_000;
 const CONSUMPTION_CAPACITY = 10;
+const AQPICK_TIMEOUT_MS = 10_000;
+const AQPICK_STATUS_KEY = "pi-quota-pick";
 const DISK_CACHE_DIR = join(homedir(), ".pi", "agent", "pi-check-agent-quota");
 const DISK_CACHE_FILE = join(DISK_CACHE_DIR, "quota-cache.json");
-const DISK_CACHE_TEMP_FILE = `${DISK_CACHE_FILE}.tmp`;
 const DISK_CACHE_MODE = 0o600;
 const DISK_CACHE_DIR_MODE = 0o700;
+const MAX_DISK_CACHE_BYTES = 1024 * 1024;
+const MAX_PAYLOAD_ITEMS = 32;
+const MAX_PAYLOAD_METRICS = 16;
+const MAX_DISPLAY_TEXT_LENGTH = 256;
+const MAX_METRIC_NAME_LENGTH = 64;
+const MAX_CURRENCY_LENGTH = 8;
+const UNSAFE_DISPLAY_TEXT_RE = /[\u0000-\u001f\u007f-\u009f]|\p{Cf}/u;
+const UNSAFE_DISPLAY_TEXT_GLOBAL_RE = /[\u0000-\u001f\u007f-\u009f]|\p{Cf}/gu;
+const UNSAFE_OBJECT_KEYS = new Set(["__proto__", "prototype", "constructor"]);
 
 type QuotaSnapshot = FetchPayload & {
   provider: string;
@@ -67,13 +79,23 @@ type RefreshResult =
   | { ok: true; snapshot: QuotaSnapshot }
   | { ok: false };
 
+type PiModel = ReturnType<ExtensionContext["modelRegistry"]["getAvailable"]>[number];
+
+type AqPickProvider = {
+  id: string;
+  label: string;
+  models: PiModel[];
+  snapshot: QuotaSnapshot;
+};
+
 type RefreshTrigger =
   | "session_start"
   | "model_select"
   | "agent_start_stale"
   | "agent_settled"
-  | "checkaq"
-  | "auto_refresh";
+  | "aqcheck"
+  | "auto_refresh"
+  | "aqpick";
 
 let cachedItems: RenderItem[] = emptyItems();
 
@@ -104,18 +126,35 @@ type InflightRequest = {
   resolveDone: (result: RefreshResult) => void;
 };
 let inflightRequest: InflightRequest | null = null;
+let aqPickController: AbortController | null = null;
+let aqPickSwitchSnapshot: { provider: string; fetchedAt: number } | null = null;
 let isShuttingDown = false;
 
-let lastCheckaqAt = 0;
-let lastCheckaqProvider: string | null = null;
+const PROVIDER_LABELS: Readonly<Record<string, string>> = {
+  minimax: "MiniMax",
+  "minimax-cn": "MiniMax CN",
+  moonshotai: "Kimi API",
+  "moonshotai-cn": "Kimi API CN",
+  "kimi-coding": "Kimi For Coding",
+  zai: "Z.AI / GLM",
+  "zai-coding-cn": "Z.AI Coding Plan",
+  deepseek: "DeepSeek",
+  openrouter: "OpenRouter",
+  "opencode-go": "OpenCode Go",
+  "openai-codex": "OpenAI Codex",
+};
+
+let lastAqCheckAt = 0;
+let lastAqCheckProvider: string | null = null;
 
 function readDiskCacheSync(): DiskCache | null {
+  let fd: number | undefined;
   try {
-    const raw = readFileSync(DISK_CACHE_FILE, "utf8");
-
-    try {
-      chmodSync(DISK_CACHE_FILE, DISK_CACHE_MODE);
-    } catch {}
+    fd = openSync(DISK_CACHE_FILE, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
+    const info = fstatSync(fd);
+    if (!info.isFile() || info.nlink !== 1 || info.size > MAX_DISK_CACHE_BYTES) return null;
+    fchmodSync(fd, DISK_CACHE_MODE);
+    const raw = readFileSync(fd, "utf8");
     const j = JSON.parse(raw) as DiskCache;
     if (
       !j ||
@@ -128,6 +167,12 @@ function readDiskCacheSync(): DiskCache | null {
     return j;
   } catch {
     return null;
+  } finally {
+    if (fd !== undefined) {
+      try {
+        closeSync(fd);
+      } catch {}
+    }
   }
 }
 
@@ -193,10 +238,25 @@ function writeDiskCacheAsync(): void {
 
 async function writeDiskFile(data: string): Promise<void> {
   await mkdir(DISK_CACHE_DIR, { recursive: true, mode: DISK_CACHE_DIR_MODE });
-  await writeFile(DISK_CACHE_TEMP_FILE, data, { encoding: "utf8", mode: DISK_CACHE_MODE });
-  await chmod(DISK_CACHE_TEMP_FILE, DISK_CACHE_MODE);
-  await rename(DISK_CACHE_TEMP_FILE, DISK_CACHE_FILE);
-  await chmod(DISK_CACHE_FILE, DISK_CACHE_MODE);
+  const directory = await lstat(DISK_CACHE_DIR);
+  if (!directory.isDirectory() || directory.isSymbolicLink()) {
+    throw new Error("unsafe cache directory");
+  }
+  await chmod(DISK_CACHE_DIR, DISK_CACHE_DIR_MODE);
+
+  const tempFile = `${DISK_CACHE_FILE}.${randomUUID()}.tmp`;
+  try {
+    const handle = await open(tempFile, "wx", DISK_CACHE_MODE);
+    try {
+      await handle.writeFile(data, { encoding: "utf8" });
+    } finally {
+      await handle.close();
+    }
+    await rename(tempFile, DISK_CACHE_FILE);
+    await chmod(DISK_CACHE_FILE, DISK_CACHE_MODE);
+  } finally {
+    await unlink(tempFile).catch(() => {});
+  }
 }
 
 function updateSuccessfulLine(provider: string, snapshot: QuotaSnapshot, trigger: RefreshTrigger): void {
@@ -758,8 +818,12 @@ function handleSessionStart(ctx: ExtensionContext, reason: SessionStartReason): 
 function handleModelSelect(ctx: ExtensionContext): void {
   const providerId = normalizeProvider(ctx.model?.provider);
   if (!providerId) return;
+  const aqPickSnapshotIsFresh =
+    aqPickSwitchSnapshot?.provider === providerId &&
+    Date.now() - aqPickSwitchSnapshot.fetchedAt <= AQPICK_TIMEOUT_MS;
+  aqPickSwitchSnapshot = null;
   currentProvider = providerId;
-  currentStatus = isUnProvider(providerId) ? "un-provider" : "fetching";
+  currentStatus = isUnProvider(providerId) ? "un-provider" : aqPickSnapshotIsFresh ? "ok" : "fetching";
   if (!baseRound) {
 
     lastDiff = null;
@@ -771,10 +835,10 @@ function handleModelSelect(ctx: ExtensionContext): void {
     writeDiskCacheAsync();
   }
   refreshWidget(ctx);
-  void refreshQuota(ctx, "model_select");
+  if (!aqPickSnapshotIsFresh) void refreshQuota(ctx, "model_select");
 }
 
-async function runCheckaq(ctx: ExtensionContext): Promise<void> {
+async function runAqCheck(ctx: ExtensionContext): Promise<void> {
   const providerId = normalizeProvider(ctx.model?.provider);
   if (!providerId) {
     ctx.ui.notify(LOCALES[currentLanguage].noActiveProvider, "warning");
@@ -792,7 +856,7 @@ async function runCheckaq(ctx: ExtensionContext): Promise<void> {
 
   const now = Date.now();
   const withinThrottle =
-    lastCheckaqProvider === providerId && lastCheckaqAt !== 0 && now - lastCheckaqAt <= CHECKAQ_THROTTLE_MS;
+    lastAqCheckProvider === providerId && lastAqCheckAt !== 0 && now - lastAqCheckAt <= AQCHECK_THROTTLE_MS;
   if (withinThrottle) {
 
     const request = inflightRequest;
@@ -801,9 +865,9 @@ async function runCheckaq(ctx: ExtensionContext): Promise<void> {
     return;
   }
 
-  lastCheckaqAt = now;
-  lastCheckaqProvider = providerId;
-  await refreshQuota(ctx, "checkaq");
+  lastAqCheckAt = now;
+  lastAqCheckProvider = providerId;
+  await refreshQuota(ctx, "aqcheck");
 }
 
 function summarizeConsumptions(records: ConsumptionRecord[]): string {
@@ -920,12 +984,7 @@ async function runAqAuto(args: string, ctx: ExtensionContext): Promise<void> {
 
   const [cmd] = parts;
   let value: number | null = null;
-  if (parts.length === 1 && (cmd === "off" || cmd === "0")) {
-    value = 0;
-  } else if (parts.length === 1 && cmd === "on") {
-    const current = getQuotaSettings().autoRefreshMinutes;
-    value = current > 0 ? current : 5;
-  } else if (parts.length === 1) {
+  if (parts.length === 1) {
     const n = Number(cmd);
 
     if (Number.isInteger(n) && n >= 0 && n <= AUTO_REFRESH_MAX_MINUTES) value = n;
@@ -941,6 +1000,240 @@ async function runAqAuto(args: string, ctx: ExtensionContext): Promise<void> {
   ctx.ui.notify(value > 0 ? locale.aqautoEnabled(value) : locale.aqautoDisabled, "info");
 }
 
+function isSafeDisplayText(value: unknown, maxLength: number, allowEmpty = false): value is string {
+  return typeof value === "string" &&
+    (allowEmpty || value.length > 0) &&
+    value.length <= maxLength &&
+    !UNSAFE_DISPLAY_TEXT_RE.test(value);
+}
+
+function isSafeMetricName(value: unknown): value is string {
+  return isSafeDisplayText(value, MAX_METRIC_NAME_LENGTH) && !UNSAFE_OBJECT_KEYS.has(value);
+}
+
+function safeDisplayText(value: string, maxLength = 96): string {
+  return value
+    .replace(UNSAFE_DISPLAY_TEXT_GLOBAL_RE, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, maxLength);
+}
+
+function providerDisplayName(provider: string): string {
+  return PROVIDER_LABELS[provider] ?? safeDisplayText(provider);
+}
+
+function aqPickModels(ctx: ExtensionContext): PiModel[] {
+  const source = ctx.scopedModels.length > 0
+    ? ctx.scopedModels.map((entry) => entry.model)
+    : ctx.modelRegistry.getAvailable();
+  const seen = new Set<string>();
+  const models: PiModel[] = [];
+  for (const model of source) {
+    const provider = normalizeProvider(model.provider);
+    if (!provider || isUnProvider(provider)) continue;
+    const key = `${provider}/${model.id}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    models.push(model);
+  }
+  return models;
+}
+
+function aqPickResetText(resetAt: number | undefined): string {
+  if (resetAt === undefined) return "";
+  const remaining = resetAt - Date.now();
+  if (!Number.isFinite(remaining) || remaining <= 0) return "";
+  return remaining >= 24 * 3_600_000 ? formatDays(remaining) : formatRemaining(remaining);
+}
+
+function aqPickSummary(snapshot: QuotaSnapshot): string {
+  const locale = LOCALES[currentLanguage];
+  if (snapshot.kind === "balance") {
+    const value = snapshot.metrics.balance;
+    return `${locale.balance} ${safeDisplayText(snapshot.currency ?? "", MAX_CURRENCY_LENGTH)}${value.toFixed(2)}`;
+  }
+
+  return Object.entries(snapshot.metrics).map(([metric, rawPct]) => {
+    const label = metric === "used" ? locale.usage : metric;
+    const pct = Math.round(clampPct(rawPct));
+    const usage = currentLanguage === "zh"
+      ? `${label}${locale.aqpickUsed}${pct}%`
+      : `${label} ${locale.aqpickUsed} ${pct}%`;
+    const reset = aqPickResetText(snapshot.resetAt?.[metric]);
+    if (!reset) return usage;
+    const resetText = locale.aqpickResetsIn(reset);
+    return currentLanguage === "zh" ? `${usage}（${resetText}）` : `${usage} (${resetText})`;
+  }).join(" · ");
+}
+
+async function fetchAqPickProvider(
+  ctx: ExtensionContext,
+  provider: string,
+  models: PiModel[],
+  signal: AbortSignal,
+): Promise<AqPickProvider | null> {
+  const resolved = await ctx.modelRegistry.getProviderAuth(provider);
+  const resolvedAuth = resolved?.auth;
+  const apiKey = resolvedAuth?.apiKey || bearerFromAuthHeaders(resolvedAuth?.headers);
+  if (!apiKey || signal.aborted) return null;
+
+  const auth: Auth = { apiKey, baseUrl: resolvedAuth?.baseUrl };
+  const payload = await fetchProviderQuota(provider, auth, signal);
+  if (!payload || signal.aborted) return null;
+  validatePayload(payload);
+  return {
+    id: provider,
+    label: providerDisplayName(provider),
+    models,
+    snapshot: { provider, fetchedAt: Date.now(), ...payload },
+  };
+}
+
+async function collectAqPickProviders(ctx: ExtensionContext): Promise<AqPickProvider[]> {
+  const grouped = new Map<string, PiModel[]>();
+  for (const model of aqPickModels(ctx)) {
+    const provider = normalizeProvider(model.provider);
+    if (!provider) continue;
+    const models = grouped.get(provider) ?? [];
+    models.push(model);
+    grouped.set(provider, models);
+  }
+  const entries = [...grouped.entries()];
+  if (entries.length === 0) return [];
+
+  aqPickController?.abort();
+  const controller = new AbortController();
+  aqPickController = controller;
+  const choices: AqPickProvider[] = [];
+  let timedOut = false;
+
+  const work = Promise.all(entries.map(async ([provider, models]) => {
+    try {
+      const choice = await fetchAqPickProvider(ctx, provider, models, controller.signal);
+      if (choice && !controller.signal.aborted) choices.push(choice);
+    } catch {}
+  })).then(() => undefined);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<void>((resolve) => {
+    timer = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+      resolve();
+    }, AQPICK_TIMEOUT_MS);
+  });
+
+  await Promise.race([work, timeout]);
+  if (timer !== undefined) clearTimeout(timer);
+  if (timedOut) void work.catch(() => {});
+  if (aqPickController === controller) aqPickController = null;
+
+  const current = normalizeProvider(ctx.model?.provider);
+  choices.sort((a, b) => {
+    if (a.id === current && b.id !== current) return -1;
+    if (b.id === current && a.id !== current) return 1;
+    return a.label.localeCompare(b.label, "en", { sensitivity: "base" }) || a.id.localeCompare(b.id);
+  });
+
+  return choices;
+}
+
+function aqPickProviderOption(choice: AqPickProvider, current: string | null): string {
+  const locale = LOCALES[currentLanguage];
+  const marker = choice.id === current
+    ? currentLanguage === "zh" ? `（${locale.aqpickCurrent}）` : ` (${locale.aqpickCurrent})`
+    : "";
+  return `${choice.label}${marker} — ${aqPickSummary(choice.snapshot)}`;
+}
+
+function aqPickModelOption(model: PiModel, current: PiModel | undefined): string {
+  const name = safeDisplayText(model.name);
+  const id = safeDisplayText(model.id);
+  const base = name === id ? id : `${name} (${id})`;
+  if (model.provider !== current?.provider || model.id !== current.id) return base;
+  const marker = LOCALES[currentLanguage].aqpickCurrent;
+  return currentLanguage === "zh" ? `${base}（${marker}）` : `${base} (${marker})`;
+}
+
+async function runAqPick(args: string, ctx: ExtensionContext, pi: ExtensionAPI): Promise<void> {
+  const locale = LOCALES[currentLanguage];
+  if (args.trim() !== "") {
+    ctx.ui.notify(locale.aqpickUsage, "warning");
+    return;
+  }
+  if (!ctx.hasUI) {
+    ctx.ui.notify(locale.aqpickRequiresUi, "warning");
+    return;
+  }
+
+  ctx.ui.setStatus(AQPICK_STATUS_KEY, locale.aqpickRefreshing);
+  let choices: AqPickProvider[];
+  try {
+    choices = await collectAqPickProviders(ctx);
+  } finally {
+    ctx.ui.setStatus(AQPICK_STATUS_KEY, undefined);
+  }
+  if (choices.length === 0) {
+    ctx.ui.notify(locale.aqpickNoProviders, "warning");
+    return;
+  }
+
+  const current = normalizeProvider(ctx.model?.provider);
+  const providerOptions = choices.map((choice) => ({
+    choice,
+    text: aqPickProviderOption(choice, current),
+  }));
+  const providerText = await ctx.ui.select(locale.aqpickProviderPrompt, providerOptions.map((item) => item.text));
+  if (!providerText) return;
+  const selectedProvider = providerOptions.find((item) => item.text === providerText)?.choice;
+  if (!selectedProvider) return;
+
+  let selectedModel: PiModel | undefined;
+  if (selectedProvider.models.length === 1) {
+    selectedModel = selectedProvider.models[0];
+  } else {
+    const modelOptions = selectedProvider.models.map((model) => ({
+      model,
+      text: aqPickModelOption(model, ctx.model),
+    }));
+    const modelText = await ctx.ui.select(
+      locale.aqpickModelPrompt(selectedProvider.label),
+      modelOptions.map((item) => item.text),
+    );
+    if (!modelText) return;
+    selectedModel = modelOptions.find((item) => item.text === modelText)?.model;
+  }
+  if (!selectedModel) return;
+
+  const previousState = providerState.get(selectedProvider.id);
+  const previousStateCopy = previousState ? { ...previousState } : undefined;
+  updateSuccessfulLine(selectedProvider.id, selectedProvider.snapshot, "aqpick");
+
+  const switchSnapshot = {
+    provider: selectedProvider.id,
+    fetchedAt: selectedProvider.snapshot.fetchedAt,
+  };
+  aqPickSwitchSnapshot = switchSnapshot;
+  let switched = false;
+  try {
+    switched = await pi.setModel(selectedModel);
+  } catch {}
+  if (!switched) {
+    if (previousStateCopy) providerState.set(selectedProvider.id, previousStateCopy);
+    else providerState.delete(selectedProvider.id);
+    if (aqPickSwitchSnapshot === switchSnapshot) aqPickSwitchSnapshot = null;
+    ctx.ui.notify(locale.aqpickSwitchFailed, "warning");
+    return;
+  }
+  if (aqPickSwitchSnapshot === switchSnapshot) aqPickSwitchSnapshot = null;
+  lastAutoAttemptAt = Date.now();
+  writeDiskCacheAsync();
+  ctx.ui.notify(
+    locale.aqpickSwitched(safeDisplayText(selectedProvider.id), safeDisplayText(selectedModel.id)),
+    "info",
+  );
+}
+
 async function runAq10(ctx: ExtensionContext): Promise<void> {
   const locale = LOCALES[currentLanguage];
   const providerId = normalizeProvider(ctx.model?.provider);
@@ -948,30 +1241,31 @@ async function runAq10(ctx: ExtensionContext): Promise<void> {
     ctx.ui.notify(locale.noActiveProvider, "warning");
     return;
   }
+  const safeProviderId = safeDisplayText(providerId);
   if (isUnProvider(providerId)) {
-    ctx.ui.notify(`${providerId}: ${locale.quotaUnavailable}`, "info");
+    ctx.ui.notify(`${safeProviderId}: ${locale.quotaUnavailable}`, "info");
     return;
   }
   const records = providerState.get(providerId)?.consumptions ?? [];
   if (records.length === 0) {
-    ctx.ui.notify(`${providerId}: ${locale.noConsumptionRecords}`, "info");
+    ctx.ui.notify(`${safeProviderId}: ${locale.noConsumptionRecords}`, "info");
     return;
   }
   const body = summarizeConsumptions(records);
   if (!body) {
-    ctx.ui.notify(`${providerId}: ${locale.noConsumptionRecords}`, "info");
+    ctx.ui.notify(`${safeProviderId}: ${locale.noConsumptionRecords}`, "info");
     return;
   }
   const colored = hexFg(QUOTA_COLORS.consumption, body);
-  ctx.ui.notify(`${providerId} ${locale.aq10Rounds(records.length)} ${colored}`, "info");
+  ctx.ui.notify(`${safeProviderId} ${locale.aq10Rounds(records.length)} ${colored}`, "info");
 }
 
 function registerLocalizedCommands(pi: ExtensionAPI): void {
   const locale = LOCALES[currentLanguage];
-  pi.registerCommand(CMD_NAME, {
-    description: locale.checkaqDescription,
+  pi.registerCommand(AQCHECK_CMD_NAME, {
+    description: locale.aqcheckDescription,
     handler: async (_args, ctx) => {
-      await runCheckaq(ctx);
+      await runAqCheck(ctx);
     },
   });
   pi.registerCommand(AQ10_CMD_NAME, {
@@ -998,6 +1292,12 @@ function registerLocalizedCommands(pi: ExtensionAPI): void {
       await runAqAuto(args, ctx);
     },
   });
+  pi.registerCommand(AQPICK_CMD_NAME, {
+    description: locale.aqpickDescription,
+    handler: async (args, ctx) => {
+      await runAqPick(args, ctx, pi);
+    },
+  });
 }
 
 export default function (pi: ExtensionAPI) {
@@ -1008,6 +1308,9 @@ export default function (pi: ExtensionAPI) {
     const request = inflightRequest;
     inflightRequest = null;
     request?.controller.abort();
+    aqPickController?.abort();
+    aqPickController = null;
+    aqPickSwitchSnapshot = null;
 
     await diskWriteQueue;
   });
@@ -1044,40 +1347,57 @@ function validatePayload(payload: unknown): void {
   if (!payload || typeof payload !== "object") throw new Error("invalid quota data");
   const p = payload as Partial<FetchPayload>;
   if (p.kind !== "balance" && p.kind !== "quota") throw new Error("invalid quota kind");
-  if (!Array.isArray(p.items) || p.items.length === 0) throw new Error("invalid quota items");
+  if (!Array.isArray(p.items) || p.items.length === 0 || p.items.length > MAX_PAYLOAD_ITEMS) {
+    throw new Error("invalid quota items");
+  }
+
   const metrics = p.metrics;
+  if (!metrics || typeof metrics !== "object" || Array.isArray(metrics)) {
+    throw new Error("invalid quota metrics");
+  }
+  const metricEntries = Object.entries(metrics);
   if (
-    !metrics ||
-    typeof metrics !== "object" ||
-    Array.isArray(metrics) ||
-    Object.keys(metrics).length === 0 ||
-    Object.values(metrics).some((value) => !Number.isFinite(value))
+    metricEntries.length === 0 ||
+    metricEntries.length > MAX_PAYLOAD_METRICS ||
+    metricEntries.some(([key, value]) => !isSafeMetricName(key) || !Number.isFinite(value))
   ) {
     throw new Error("invalid quota metrics");
   }
-  if (
-    p.resetAt !== undefined &&
-    (!p.resetAt ||
-      typeof p.resetAt !== "object" ||
-      Array.isArray(p.resetAt) ||
-      Object.values(p.resetAt).some((value) => typeof value !== "number" || !Number.isFinite(value) || value <= 0))
-  ) {
-    throw new Error("invalid quota resetAt");
+
+  if (p.resetAt !== undefined) {
+    if (!p.resetAt || typeof p.resetAt !== "object" || Array.isArray(p.resetAt)) {
+      throw new Error("invalid quota resetAt");
+    }
+    const resetEntries = Object.entries(p.resetAt);
+    if (
+      resetEntries.length > MAX_PAYLOAD_METRICS ||
+      resetEntries.some(([key, value]) =>
+        !isSafeMetricName(key) ||
+        !Object.hasOwn(metrics, key) ||
+        typeof value !== "number" ||
+        !Number.isFinite(value) ||
+        value <= 0)
+    ) {
+      throw new Error("invalid quota resetAt");
+    }
   }
+
   for (const raw of p.items) {
     if (!raw || typeof raw !== "object") throw new Error("invalid quota item");
     const item = raw as Record<string, unknown>;
     switch (item.kind) {
       case "text":
       case "annotation":
-        if (typeof item.text !== "string") throw new Error("invalid quota text");
+        if (!isSafeDisplayText(item.text, MAX_DISPLAY_TEXT_LENGTH, true)) {
+          throw new Error("invalid quota text");
+        }
         break;
       case "pct": {
         const pct = item.pct;
         if (typeof pct !== "number" || !Number.isFinite(pct) || pct < 0) {
           throw new Error("invalid quota pct");
         }
-        if (item.metric !== undefined && typeof item.metric !== "string") {
+        if (item.metric !== undefined && !isSafeMetricName(item.metric)) {
           throw new Error("invalid quota metric");
         }
         break;
@@ -1085,10 +1405,10 @@ function validatePayload(payload: unknown): void {
       case "balance": {
         const value = item.value;
         if (typeof value !== "number" || !Number.isFinite(value)) throw new Error("invalid quota balance");
-        if (typeof item.currency !== "string" || item.currency === "") {
+        if (!isSafeDisplayText(item.currency, MAX_CURRENCY_LENGTH)) {
           throw new Error("invalid balance currency");
         }
-        if (item.metric !== undefined && typeof item.metric !== "string") {
+        if (item.metric !== undefined && !isSafeMetricName(item.metric)) {
           throw new Error("invalid quota metric");
         }
         break;
@@ -1098,7 +1418,7 @@ function validatePayload(payload: unknown): void {
     }
   }
   if (p.kind === "balance") {
-    if (typeof p.currency !== "string" || p.currency === "") throw new Error("invalid balance currency");
+    if (!isSafeDisplayText(p.currency, MAX_CURRENCY_LENGTH)) throw new Error("invalid balance currency");
     if (!Number.isFinite(metrics.balance)) throw new Error("invalid balance");
   }
 }
@@ -1109,10 +1429,11 @@ function isValidConsumptionRecord(value: unknown): value is ConsumptionRecord {
   if (!Number.isFinite(record.at)) return false;
   if (record.kind !== "balance" && record.kind !== "quota") return false;
   if (!record.deltas || typeof record.deltas !== "object" || Array.isArray(record.deltas)) return false;
-  if (record.currency !== undefined && typeof record.currency !== "string") return false;
-  const values = Object.values(record.deltas);
-
-  return values.length > 0 && values.every((value) => Number.isFinite(value) && value <= 0);
+  if (record.currency !== undefined && !isSafeDisplayText(record.currency, MAX_CURRENCY_LENGTH)) return false;
+  const entries = Object.entries(record.deltas);
+  return entries.length > 0 &&
+    entries.length <= MAX_PAYLOAD_METRICS &&
+    entries.every(([key, amount]) => isSafeMetricName(key) && Number.isFinite(amount) && amount <= 0);
 }
 
 function diffSnapshot(before: QuotaSnapshot, after: QuotaSnapshot): DiffResult {

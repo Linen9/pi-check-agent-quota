@@ -19,6 +19,7 @@ export type Fetcher = (auth: Auth, signal: AbortSignal) => Promise<FetchPayload>
 
 const RETRY_COUNT = 3;
 const RETRY_DELAY_MS = 500;
+const MAX_RESPONSE_BYTES = 1024 * 1024;
 const DEFAULT_BOOST_PERMILLE = 1000;
 
 export class QuotaError extends Error {
@@ -137,6 +138,42 @@ export function makeSignal(timeoutMs: number, external: AbortSignal): AbortSigna
   return AbortSignal.any([AbortSignal.timeout(timeoutMs), external]);
 }
 
+async function boundedResponseText(response: Response): Promise<string> {
+  const declaredLength = Number(response.headers?.get?.("content-length"));
+  if (Number.isFinite(declaredLength) && declaredLength > MAX_RESPONSE_BYTES) {
+    throw new QuotaError("response_too_large");
+  }
+
+  const body = response.body;
+  if (!body || typeof body.getReader !== "function") {
+    const text = await response.text();
+    if (Buffer.byteLength(text, "utf8") > MAX_RESPONSE_BYTES) {
+      throw new QuotaError("response_too_large");
+    }
+    return text;
+  }
+
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let bytes = 0;
+  let text = "";
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      bytes += value.byteLength;
+      if (bytes > MAX_RESPONSE_BYTES) {
+        await reader.cancel().catch(() => {});
+        throw new QuotaError("response_too_large");
+      }
+      text += decoder.decode(value, { stream: true });
+    }
+    return text + decoder.decode();
+  } finally {
+    reader.releaseLock();
+  }
+}
+
 export async function jsonFetch<T = any>(
   url: string,
   headers: Record<string, string>,
@@ -149,13 +186,21 @@ export async function jsonFetch<T = any>(
     redirect: "error",
   });
   if (!r.ok) throw new QuotaError("http", r.status);
-  const raw = await r.text();
+  const raw = await boundedResponseText(r);
   try {
     return JSON.parse(raw) as T;
   } catch {
-
     throw new QuotaError("invalid_json");
   }
+}
+
+function isRetryableError(error: unknown): boolean {
+  if (error instanceof QuotaError) {
+    if (error.category !== "http" || error.status === undefined) return false;
+    return error.status === 408 || error.status === 425 || error.status === 429 || error.status >= 500;
+  }
+  if (error instanceof DOMException) return error.name === "TimeoutError";
+  return error instanceof TypeError;
 }
 
 export async function fetchWithRetry<T>(signal: AbortSignal, fn: () => Promise<T>): Promise<T> {
@@ -167,9 +212,8 @@ export async function fetchWithRetry<T>(signal: AbortSignal, fn: () => Promise<T
     } catch (err) {
       if (signal.aborted) throw err instanceof Error ? err : new Error(String(err));
       lastErr = err;
-      if (attempt < RETRY_COUNT - 1) {
-        await new Promise((r) => setTimeout(r, RETRY_DELAY_MS));
-      }
+      if (!isRetryableError(err) || attempt === RETRY_COUNT - 1) break;
+      await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY_MS));
     }
   }
   throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
@@ -353,8 +397,9 @@ export async function fetchKimi(auth: Auth, signal: AbortSignal): Promise<FetchP
 }
 
 export async function fetchZhipuBalance(auth: Auth, signal: AbortSignal): Promise<FetchPayload> {
+  const url = quotaUrl(auth.baseUrl, "https://www.bigmodel.cn", "/api/biz/account/query-customer-account-report");
   const j = await jsonFetch<any>(
-    "https://www.bigmodel.cn/api/biz/account/query-customer-account-report",
+    url,
     { Authorization: auth.apiKey },
     10_000,
     signal,
@@ -378,8 +423,9 @@ export async function fetchZhipuBalance(auth: Auth, signal: AbortSignal): Promis
 }
 
 export async function fetchZhipuCoding(auth: Auth, signal: AbortSignal): Promise<FetchPayload> {
+  const url = quotaUrl(auth.baseUrl, "https://open.bigmodel.cn", "/api/monitor/usage/quota/limit");
   const j = await jsonFetch<any>(
-    "https://open.bigmodel.cn/api/monitor/usage/quota/limit",
+    url,
     { Authorization: auth.apiKey },
     10_000,
     signal,
@@ -406,8 +452,9 @@ export async function fetchZhipuCoding(auth: Auth, signal: AbortSignal): Promise
 }
 
 export async function fetchDeepseek(auth: Auth, signal: AbortSignal): Promise<FetchPayload> {
+  const url = quotaUrl(auth.baseUrl, "https://api.deepseek.com", "/user/balance");
   const j = await jsonFetch<any>(
-    "https://api.deepseek.com/user/balance",
+    url,
     bearerHeaders(auth.apiKey),
     10_000,
     signal,
@@ -430,8 +477,9 @@ export async function fetchDeepseek(auth: Auth, signal: AbortSignal): Promise<Fe
 }
 
 export async function fetchOpenrouter(auth: Auth, signal: AbortSignal): Promise<FetchPayload> {
+  const url = quotaUrl(auth.baseUrl, "https://openrouter.ai/api/v1", "/credits");
   const j = await jsonFetch<any>(
-    "https://openrouter.ai/api/v1/credits",
+    url,
     bearerHeaders(auth.apiKey),
     10_000,
     signal,
@@ -451,8 +499,9 @@ export async function fetchOpenrouter(auth: Auth, signal: AbortSignal): Promise<
 }
 
 export async function fetchOpencodeGo(auth: Auth, signal: AbortSignal): Promise<FetchPayload> {
+  const url = quotaUrl(auth.baseUrl, "https://opencode.ai/zen/go/v1", "/usage");
   const j = await jsonFetch<any>(
-    "https://opencode.ai/zen/go/v1/usage",
+    url,
     bearerHeaders(auth.apiKey),
     10_000,
     signal,
@@ -525,15 +574,21 @@ export async function fetchOpencodeGo(auth: Auth, signal: AbortSignal): Promise<
 
 const CODEX_JWT_CLAIM_PATH = "https://api.openai.com/auth";
 const CODEX_DEFAULT_BASE = "https://chatgpt.com/backend-api";
+const MAX_CODEX_TOKEN_LENGTH = 64 * 1024;
+const MAX_CODEX_ACCOUNT_ID_LENGTH = 256;
 
 export function extractChatGptAccountId(token: string | undefined): string | null {
-  if (typeof token !== "string") return null;
+  if (typeof token !== "string" || token.length > MAX_CODEX_TOKEN_LENGTH) return null;
   const parts = token.split(".");
-  if (parts.length !== 3) return null;
+  if (parts.length !== 3 || (parts[1]?.length ?? 0) > MAX_CODEX_TOKEN_LENGTH) return null;
   try {
     const payload = JSON.parse(Buffer.from(parts[1] ?? "", "base64").toString("utf8"));
     const accountId = payload?.[CODEX_JWT_CLAIM_PATH]?.chatgpt_account_id;
-    return typeof accountId === "string" && accountId !== "" ? accountId : null;
+    return typeof accountId === "string" &&
+      accountId.length <= MAX_CODEX_ACCOUNT_ID_LENGTH &&
+      /^[A-Za-z0-9._:-]+$/.test(accountId)
+      ? accountId
+      : null;
   } catch {
     return null;
   }

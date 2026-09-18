@@ -14,10 +14,18 @@ jobs:
         with:
           node-version: '24'
           registry-url: 'https://registry.npmjs.org'
+      - run: npm ci --ignore-scripts
+      - run: npm run typecheck
+      - run: npm test
       - run: |
           VERSION=$(node -p "require('./package.json').version")
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          if [ "$VERSION" != "$TAG_VERSION" ]; then
+            echo "Tag v$TAG_VERSION does not match package version $VERSION" >&2
+            exit 1
+          fi
           if npm view pi-check-agent-quota@"$VERSION" version >/dev/null 2>&1; then
             echo "v$VERSION already published, skipping"
           else
-            npm publish
+            npm publish --provenance
           fi
