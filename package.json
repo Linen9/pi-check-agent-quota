@@ -23,10 +23,12 @@
     "type": "git",
     "url": "git+https://github.com/Linen9/pi-check-agent-quota.git"
   },
-  "homepage": "https://github.com/Linen9/pi-check-agent-quota#readme",
+  "homepage": "https://github.com/Linen9/pi-check-agent-quota/blob/main/README_EN.md",
   "type": "module",
   "files": [
-    "extensions"
+    "extensions",
+    "README_CN.md",
+    "README_EN.md"
   ],
   "engines": {
     "node": ">=23.6"
