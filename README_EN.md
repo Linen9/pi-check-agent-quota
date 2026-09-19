@@ -4,6 +4,10 @@ Display AI provider quota, balance, and recent dialogue-round consumption in the
 
 English | [中文说明](./README.md)
 
+[![npm version](https://img.shields.io/npm/v/pi-check-agent-quota?logo=npm)](https://www.npmjs.com/package/pi-check-agent-quota)
+[![npm downloads](https://img.shields.io/npm/dm/pi-check-agent-quota?logo=npm)](https://www.npmjs.com/package/pi-check-agent-quota)
+[![License](https://img.shields.io/github/license/Linen9/pi-check-agent-quota)](LICENSE)
+
 ![widget preview](https://raw.githubusercontent.com/Linen9/pi-check-agent-quota/main/assets/screenshot-en.png)
 
 ## Supported Providers
